@@ -7,17 +7,35 @@ description: Use when open GitHub pull requests have Copilot comments or non-e2e
 
 ## Overview
 
-Use this skill inside a Codex Automation that coordinates PR feedback repair. The automation watches open PRs created by or assigned to the user, reconciles GitHub and Buildkite facts with local loop state, derives an in-memory worklist, and launches at most one normal Codex worker.
+Use this skill as the policy reference for the program-driven Codex Automation in `scripts/pr-automation-loop.mjs`.
 
-This skill is a coordinator workflow. It does not replace the Superpowers skill chain used by the worker. It also does not replace `loop-state`. The coordinator reads and reconciles durable state at wake-up and completion boundaries; the worker writes durable completion facts for its assigned trigger.
+The automation runtime is the program, not this skill. The program watches open PRs, derives the current worklist, maintains the single active worker lock, renders `worker-prompt-template.md`, and launches one normal Codex worker with `codex exec`. This skill defines the constraints the program and worker must obey.
 
-## Required Supporting Skill
+The worker still uses the normal Superpowers skill chain for the assigned task. `loop-state` records durable facts at resume and completion boundaries; it is not the coordinator or worker execution engine.
 
-Use `loop-state` when resuming or ending a PR loop. If `loop-state` is unavailable in the active Codex environment, stop and report that the automation cannot safely persist state.
+## Runtime Boundary
+
+Program responsibilities:
+
+- run from a scheduled Codex Automation
+- fetch GitHub and Buildkite facts
+- derive the in-memory worklist
+- maintain `.superpowers/runtime/active-worker.json`
+- render `skills/pr-automation-loop/worker-prompt-template.md`
+- launch exactly one worker with `codex exec`
+
+Skill responsibilities:
+
+- define the policy for selecting work
+- define what must be skipped or escalated
+- define how the worker should use Superpowers and `loop-state`
+- prevent queue/planner-state drift
+
+Do not implement polling, locking, or worker launch as manual skill steps. Those are runtime program concerns.
 
 ## Scope
 
-Watch open GitHub PRs matching either query. Run separate searches, then merge and deduplicate by repository and PR number:
+The program watches open GitHub PRs matching either query. It must run separate searches, then merge and deduplicate by repository and PR number:
 
 ```text
 author:@me
@@ -54,24 +72,9 @@ Runtime coordination lives separately:
 
 Runtime files are locks and logs. They are not durable loop state and not a persistent queue.
 
-## Coordinator Workflow
+## Worklist Policy
 
-On every Codex Automation wake-up:
-
-1. Identify the target project root and ensure `.superpowers/state/` and `.superpowers/runtime/` exist.
-2. Use `loop-state` to read relevant entity state and loop summaries.
-3. Check `.superpowers/runtime/active-worker.json`; if it exists, inspect the prior run before deciding whether a worker is still active.
-4. Fetch current GitHub PR facts with separate `author:@me` and `assignee:@me` searches, then merge and deduplicate PRs.
-5. Fetch current PR review comments, PR conversation comments, checks, and linked Buildkite failures.
-6. Compare current external facts against loop-state cursors and loop summaries.
-7. Build a derived worklist in memory.
-8. If `active-worker.json` exists and the prior run is not complete, do not launch another worker.
-9. If no worker is active and the derived worklist is non-empty, launch one worker for the highest-priority item.
-10. Exit after launching one worker or after recording that no work was available.
-
-The derived worklist is not a persistent queue. Rebuild it from GitHub, Buildkite, and loop-state on the next wake-up.
-
-## Worklist Priority
+The program builds a derived worklist in memory on every wake-up. The derived worklist is not a persistent queue. Rebuild it from GitHub, Buildkite, and loop-state on the next wake-up.
 
 Process items in this order:
 
@@ -79,9 +82,9 @@ Process items in this order:
 2. New actionable Copilot PR conversation comments.
 3. New non-e2e build failures.
 
-Treat a trigger as already handled when a loop summary, GitHub reply marker, resolved thread, passing current check, or stale PR head SHA proves it no longer requires work.
+For worklist derivation, treat a trigger as already handled when a loop summary, GitHub reply marker, resolved thread, passing current check, or stale PR head SHA proves it no longer requires work. This does not prove an active worker has exited.
 
-After considering repair candidates, record escalation observations immediately as factual loop summaries during reconciliation. They are not part of the derived worker worklist and must not launch workers.
+After considering repair candidates, record escalation observations immediately as factual loop summaries during reconciliation. They are not part of the derived worklist and must not launch workers.
 
 ## E2E Skip Rule
 
@@ -107,40 +110,11 @@ Maintain a single active worker globally using:
 .superpowers/runtime/active-worker.json
 ```
 
-Before launching a worker, acquire the lock atomically using exclusive file creation, a `mkdir` lock directory, or temp file plus hard-link/create-if-absent semantics. Do not use plain rename as the acquisition primitive because it can replace an existing lock. If acquisition fails, treat another worker as active and exit without launching.
+The program must acquire that runtime lock with create-if-absent semantics before launching a worker. It may update the acquired lock with the worker process identity after spawn because the lock path already blocks competing coordinators.
 
-Create the lock with:
+If `active-worker.json` exists and completion evidence is absent, do not launch another worker. Do not clear the lock merely because the trigger is stale or no longer needs work. Without completion evidence, clear a stale lock only when the recorded worker liveness identity proves the worker is no longer running and external source-of-truth facts prove the trigger is already handled. If liveness identity is missing or cannot be verified, keep the lock and escalate for human reconciliation.
 
-```json
-{
-  "version": 1,
-  "started_at": "2026-06-12T10:20:00-07:00",
-  "repo": "owner/repo",
-  "pr_number": 123,
-  "trigger_id": "github-review-comment-98765",
-  "worktree_path": "/path/to/repo/.worktrees/pr-123",
-  "run_dir": ".superpowers/runtime/runs/2026-06-12T10-20-00-pr-123-comment-98765"
-}
-```
-
-On wake-up, if the lock exists, inspect the prior run. Completion evidence is final output plus either a loop-state summary or GitHub reply marker. After reconciling completion through `loop-state`, remove `active-worker.json`. If the run is not complete, do not launch another worker.
-
-The lock schema does not record worker liveness identity. Clear stale locks without completion evidence only when external source-of-truth facts prove the trigger is already handled. Never clear based on age alone or on generic process checks.
-
-## Worker Launch
-
-Launch the worker with `codex exec` from the PR worktree:
-
-```bash
-codex exec \
-  -C "$PR_WORKTREE" \
-  -a never \
-  -s danger-full-access \
-  --json \
-  --output-last-message "$RUN_DIR/final.md" \
-  - < "$RUN_DIR/worker-prompt.md" \
-  > "$RUN_DIR/stdout.jsonl"
-```
+## Worker Launch Policy
 
 Build `$RUN_DIR/worker-prompt.md` from `skills/pr-automation-loop/worker-prompt-template.md`.
 
@@ -164,7 +138,7 @@ The worker must:
 5. Reply to GitHub.
 6. Use `loop-state` to write the loop summary and update entity/worktree facts.
 
-Do not use /goal for this first version. The coordinator scopes the worker to one trigger, and loop-state persists durable facts.
+Do not use /goal for this first version. The program scopes the worker to one trigger, and loop-state persists durable facts.
 
 ## GitHub Reply Marker
 

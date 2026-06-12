@@ -2,14 +2,14 @@
 
 ## Overview
 
-Design a Codex automation loop that watches open pull requests created by or assigned to the user, then responds to Copilot review feedback and non-e2e build failures with one normal Codex worker at a time.
+Design a program-driven Codex automation loop that watches open pull requests created by or assigned to the user, then responds to Copilot review feedback and non-e2e build failures with one normal Codex worker at a time.
 
-The automation is a loop coordinator, not the repair worker itself. On each wake-up it reconciles GitHub, Buildkite, and local loop state; derives the current worklist; and starts exactly one Codex worker only when no worker is already active.
+The automation runtime is a coordinator program, not a skill and not the repair worker itself. On each wake-up the program reconciles GitHub, Buildkite, and local loop state; derives the current worklist; and starts exactly one Codex worker only when no worker is already active. The `pr-automation-loop` skill is a policy/reference layer for the program and worker prompts, not the execution engine.
 
 The core model is:
 
 ```text
-loop-state facts + current GitHub/Buildkite state -> reconcile -> derived worklist -> one worker
+program wake-up -> loop-state facts + current GitHub/Buildkite state -> reconcile -> derived worklist -> one worker
 ```
 
 ## Goals
@@ -22,6 +22,7 @@ loop-state facts + current GitHub/Buildkite state -> reconcile -> derived workli
 6. Have the worker execute the normal Superpowers skill chain needed to complete the assigned task.
 7. Persist facts with the `loop-state` model, not with a persistent task queue.
 8. Let later runs resume by reconciling saved facts with the external source of truth.
+9. Keep polling, worklist derivation, runtime locking, prompt rendering, and worker launch in a real program.
 
 ## Non-Goals
 
@@ -31,12 +32,19 @@ loop-state facts + current GitHub/Buildkite state -> reconcile -> derived workli
 4. Do not attempt to fix e2e tests or e2e build jobs.
 5. Do not make local state the source of truth for GitHub or Buildkite.
 6. Do not rely on Codex Memories as the only state layer.
+7. Do not make a skill responsible for runtime coordination.
 
 ## Architecture
 
-### Coordinator
+### Coordinator Program
 
-The coordinator is the scheduled automation body. It wakes on a fixed cadence, such as every 10 minutes.
+The coordinator is a scheduled program invoked by Codex Automations, for example:
+
+```bash
+node scripts/pr-automation-loop.mjs --project-root "$PROJECT_ROOT" --repo owner/repo
+```
+
+It wakes on a fixed cadence, such as every 10 minutes. The program owns polling, reconciliation, single-worker locking, prompt rendering, and worker launch. Skills guide behavior after they are loaded; they do not provide the automation runtime.
 
 Each wake-up:
 
@@ -49,7 +57,9 @@ Each wake-up:
 7. If no worker is active, launches one worker for the highest-priority work item.
 8. If a worker is active, records compact observations only when useful and exits without launching another worker.
 
-The coordinator does not directly edit application code.
+The coordinator does not directly edit application code. It only starts the worker process for one selected trigger.
+
+The first implementation is zero-dependency and testable with fixture JSON. Live GitHub facts are fetched through the configured GitHub CLI when fixtures are not supplied; Buildkite detail is represented from linked check metadata in this version.
 
 ### Worker
 
@@ -69,7 +79,7 @@ The worker:
 
 Subagents are not part of the first version. The worker may still use normal Superpowers skills and tools available in its Codex session. The automation enforces a single active worker globally; it does not constrain the worker to only the `loop-state` skill.
 
-`loop-state` is not the worker's execution engine. It is used to resume from durable facts before work begins and to persist durable facts when the worker ends. The worker itself is responsible for completing the assigned repair or escalation task.
+`loop-state` is not the coordinator or worker execution engine. It is used to resume from durable facts before work begins and to persist durable facts when the worker ends. The worker itself is responsible for completing the assigned repair or escalation task.
 
 ## Trigger Sources
 
@@ -126,15 +136,27 @@ Observed Buildkite e2e job name:
 :playwright: e2e tests
 ```
 
-The first version skips any Buildkite job whose normalized name contains:
+The first version skips any failed check, failure, or Buildkite job whose normalized name contains:
 
 ```text
 e2e tests
 ```
 
-Normalization lowercases the job name and trims surrounding whitespace. The emoji-style prefix does not matter because the substring `e2e tests` remains present.
+Normalization lowercases the name and trims surrounding whitespace. The emoji-style prefix does not matter because the substring `e2e tests` remains present.
 
 If all current failures for a PR are e2e failures, the coordinator does not start a worker.
+
+## Runtime Locking
+
+The coordinator program maintains one global active worker lock at:
+
+```text
+<project-root>/.superpowers/runtime/active-worker.json
+```
+
+The program must acquire this lock with create-if-absent semantics before launching a worker. The lock may be updated with worker process identity after spawn because the path has already been acquired and blocks competing coordinators. If spawn fails, the program removes the lock before exiting.
+
+The lock is not durable loop state and is not a queue. If the lock exists and there is no completion evidence, the coordinator must not clear it merely because a trigger appears stale. It can clear the lock only when it can prove the recorded worker is no longer running and external source-of-truth facts prove the trigger has been handled. Otherwise it exits without launching another worker and records/escalates the reconciliation problem.
 
 ## State Model
 

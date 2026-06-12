@@ -2,22 +2,24 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a `pr-automation-loop` workflow skill that lets a Codex Automation coordinate one Superpowers worker at a time for Copilot PR feedback and non-e2e build failures.
+**Goal:** Add a program-driven `pr-automation-loop` Codex Automation that coordinates one Superpowers worker at a time for Copilot PR feedback and non-e2e build failures.
 
-**Architecture:** The first implementation is documentation-driven, matching the rest of Superpowers: one skill defines the coordinator workflow and one prompt template defines worker launch instructions. A static shell test verifies the single-worker rule, derived worklist rule, e2e skip rule, no `/goal` rule, Superpowers skill-chain execution, and `loop-state` persistence boundary.
+**Architecture:** The automation runtime is a zero-dependency Node program. It derives work from GitHub/Buildkite facts, owns the single-worker runtime lock, renders a worker prompt, and launches one normal `codex exec` worker. The `pr-automation-loop` skill is a policy/reference document for the program and worker, not the coordinator runtime.
 
-**Tech Stack:** Markdown skills, Bash static tests, Codex CLI `codex exec`, GitHub and Buildkite accessed through the active Codex session tools or configured CLIs.
+**Tech Stack:** Node.js standard library, Bash static tests, Markdown skills, Codex CLI `codex exec`, GitHub CLI for live PR facts, and fixture JSON for deterministic tests.
 
 ---
 
 ## File Structure
 
-- Create `tests/pr-automation-loop/test-pr-automation-loop-skill.sh` - static validation for the new skill and worker prompt template.
+- Create `tests/pr-automation-loop/test-pr-automation-loop-skill.sh` - static validation for the skill policy and worker prompt template.
+- Create `tests/pr-automation-loop/test-pr-automation-loop-program.sh` - fixture-driven validation for program worklist derivation, e2e skipping, locking, and dry-run output.
+- Create `scripts/pr-automation-loop.mjs` - program-driven coordinator runtime invoked by Codex Automations.
 - Create `skills/pr-automation-loop/worker-prompt-template.md` - reusable worker prompt template for exactly one PR trigger.
-- Create `skills/pr-automation-loop/SKILL.md` - coordinator skill used by Codex Automations.
+- Create `skills/pr-automation-loop/SKILL.md` - policy/reference skill used by the program and workers.
 - Modify `README.md` - list the new skill in the collaboration section.
 
-This plan does not add a runtime daemon, webhook listener, GitHub API client, Buildkite API client, or persistent queue. The Codex Automation run is the coordinator runtime. The worker is a normal `codex exec` session. `loop-state` remains a required supporting skill for durable facts, not the execution engine.
+This plan does not add a webhook listener, third-party dependency, Buildkite API client, or persistent queue. The Codex Automation invokes the coordinator program on a schedule. The worker is a normal `codex exec` session. `loop-state` remains a required supporting skill for durable facts, not the execution engine.
 
 ## Task 1: Add Failing Static Test
 
@@ -656,4 +658,77 @@ If packaging metadata changed in Task 5, the recent commits also include:
 
 ```text
 chore: expose PR automation skill in plugin manifests
+```
+
+## Task 7: Program-Driven Automation Pivot
+
+**Files:**
+- Modify: `docs/superpowers/specs/2026-06-12-pr-copilot-build-automation-design.md`
+- Modify: `docs/superpowers/plans/2026-06-12-pr-copilot-build-automation.md`
+- Create: `tests/pr-automation-loop/test-pr-automation-loop-program.sh`
+- Create: `scripts/pr-automation-loop.mjs`
+- Modify: `skills/pr-automation-loop/SKILL.md`
+- Test: `tests/pr-automation-loop/test-pr-automation-loop-program.sh`
+- Test: `tests/pr-automation-loop/test-pr-automation-loop-skill.sh`
+
+- [ ] **Step 1: Add a failing program-level test**
+
+Create `tests/pr-automation-loop/test-pr-automation-loop-program.sh` that builds a temporary project root, writes fixture PR facts with multiple triggers, runs `node scripts/pr-automation-loop.mjs --project-root "$TMP" --fixture "$FIXTURE" --dry-run --json`, and asserts:
+
+- the selected work item is the Copilot inline review comment
+- the derived worklist has three non-e2e items
+- one `e2e tests` failure is skipped
+- dry-run mode does not create `.superpowers/runtime/active-worker.json`
+- an existing `active-worker.json` causes the program to report `worker_active`
+
+- [ ] **Step 2: Implement the coordinator program**
+
+Create `scripts/pr-automation-loop.mjs` with zero third-party dependencies. It must:
+
+- parse `--project-root`, `--fixture`, `--repo`, `--dry-run`, and `--json`
+- load fixture facts for tests, or fetch live facts with `gh` when no fixture is supplied
+- derive an in-memory worklist from Copilot inline comments, Copilot PR conversation comments, and non-e2e failed checks
+- filter already-handled triggers using loop summaries and GitHub reply markers
+- sort by review comments first, PR comments second, build failures third
+- skip any normalized failure/check/job name containing `e2e tests`
+- respect `.superpowers/runtime/active-worker.json`
+- clear a completed worker lock only when final output contains completion evidence
+- acquire the durable lock with create-if-absent semantics before launching
+- render `skills/pr-automation-loop/worker-prompt-template.md` into a run directory
+- launch one worker with `codex exec` unless `--dry-run` is set
+- never persist a queue
+
+- [ ] **Step 3: Convert the skill to policy/reference wording**
+
+Update `skills/pr-automation-loop/SKILL.md` so it says the program is the automation runtime. The skill must remain discoverable and must keep the tested terms, but it must not present itself as the runtime coordinator. Runtime details such as polling, lock acquisition, and worker launch belong to `scripts/pr-automation-loop.mjs`.
+
+- [ ] **Step 4: Validate**
+
+Run:
+
+```bash
+tests/pr-automation-loop/test-pr-automation-loop-program.sh
+tests/pr-automation-loop/test-pr-automation-loop-skill.sh
+rg -n "Next Step:|Next Trigger:" skills/pr-automation-loop README.md scripts/pr-automation-loop.mjs
+rg -n "create a persistent queue|store a persistent queue|write a persistent queue" skills/pr-automation-loop README.md scripts/pr-automation-loop.mjs
+git diff --check
+```
+
+Expected:
+
+- both tests pass
+- both `rg` commands produce no matches
+- `git diff --check` produces no output
+
+- [ ] **Step 5: Commit**
+
+Run:
+
+```bash
+git add docs/superpowers/specs/2026-06-12-pr-copilot-build-automation-design.md \
+  docs/superpowers/plans/2026-06-12-pr-copilot-build-automation.md \
+  tests/pr-automation-loop/test-pr-automation-loop-program.sh \
+  scripts/pr-automation-loop.mjs \
+  skills/pr-automation-loop/SKILL.md
+git commit -m "feat: add program-driven PR automation coordinator"
 ```
