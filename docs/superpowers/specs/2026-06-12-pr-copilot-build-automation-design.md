@@ -19,8 +19,9 @@ loop-state facts + current GitHub/Buildkite state -> reconcile -> derived workli
 3. Ignore e2e test failures.
 4. Start only one worker globally at any time.
 5. Run the worker as a normal Codex session in the PR worktree.
-6. Persist facts with the `loop-state` model, not with a persistent task queue.
-7. Let later runs resume by reconciling saved facts with the external source of truth.
+6. Have the worker execute the normal Superpowers skill chain needed to complete the assigned task.
+7. Persist facts with the `loop-state` model, not with a persistent task queue.
+8. Let later runs resume by reconciling saved facts with the external source of truth.
 
 ## Non-Goals
 
@@ -58,14 +59,17 @@ The worker:
 
 1. Uses the PR worktree as its working directory.
 2. Receives the PR state handle, relevant loop summaries, the exact trigger, and automation rules in its prompt.
-3. Processes exactly one trigger.
-4. Makes the smallest code change that resolves the trigger.
-5. Runs targeted validation.
-6. Pushes to the PR branch when validation passes.
-7. Replies to the relevant GitHub comment thread or PR conversation.
-8. Writes a loop summary and updates entity/worktree facts.
+3. Starts with the Superpowers bootstrap and follows the applicable skill chain for the assigned task.
+4. Processes exactly one trigger through completion.
+5. Makes the smallest code change that resolves the trigger.
+6. Runs targeted validation.
+7. Pushes to the PR branch when validation passes.
+8. Replies to the relevant GitHub comment thread or PR conversation.
+9. Uses `loop-state` at the end to write a loop summary and update entity/worktree facts.
 
-Subagents are not part of the first version. The worker may use normal skills and tools available in its Codex session, but the automation enforces a single active worker globally.
+Subagents are not part of the first version. The worker may still use normal Superpowers skills and tools available in its Codex session. The automation enforces a single active worker globally; it does not constrain the worker to only the `loop-state` skill.
+
+`loop-state` is not the worker's execution engine. It is used to resume from durable facts before work begins and to persist durable facts when the worker ends. The worker itself is responsible for completing the assigned repair or escalation task.
 
 ## Trigger Sources
 
@@ -183,7 +187,7 @@ Entity ID: github:owner/repo:pull/123
 Entity file: .superpowers/state/entities/github-owner-repo-pr-123.json
 ```
 
-Worker prompts should identify this handle explicitly so the worker can read and update the correct state records.
+Worker prompts should identify this handle explicitly so the worker can reconcile prior facts before work begins and persist updated facts after the task is complete.
 
 ### Entity State
 
@@ -312,17 +316,20 @@ Process exactly one trigger:
 - PR head SHA: def456
 
 Rules:
+- Start with Superpowers skill selection and follow the applicable skill chain for this task.
 - Use the current PR worktree.
 - Make the smallest change that resolves this trigger.
 - Do not fix e2e tests or e2e build failures.
 - Run targeted validation.
 - Push to the PR branch only after validation passes.
 - Reply to the original GitHub thread with summary and validation.
-- Write one loop summary and update entity/worktree facts.
+- Use loop-state as the final persistence step: write one loop summary and update entity/worktree facts.
 - If blocked, do not guess; mark the loop summary as escalated or failed with a concrete reason.
 ```
 
 The worker may push only if the PR head SHA still matches the trigger's recorded SHA or after explicitly reconciling a safe fast-forward update.
+
+The worker launch does not use `/goal` in the first version. The prompt's scoped trigger is the worker's immediate objective, Superpowers skill selection drives execution, and `loop-state` records the completed loop.
 
 ## GitHub Replies and Markers
 
@@ -379,6 +386,7 @@ Controls:
 - single worker globally
 - PR worktree isolation
 - targeted prompt with one trigger
+- Superpowers skill chain execution inside the worker
 - no persistent queue
 - hidden markers for deduplication
 - loop summaries for auditability
