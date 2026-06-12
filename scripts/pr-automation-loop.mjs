@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { createReadStream } from 'node:fs';
 import {
+  access,
   mkdir,
   open,
   readdir,
@@ -15,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 const COPILOT_LOGIN = 'github-copilot[bot]';
 const E2E_NAME = 'e2e tests';
 const SUPERPOWERS_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const WORKER_TEMPLATE_PATH = path.join(SUPERPOWERS_ROOT, 'scripts', 'pr-automation-loop', 'worker-prompt-template.md');
 
 function usage() {
   return `Usage: node scripts/pr-automation-loop.mjs [options]
@@ -295,6 +297,88 @@ function runCommand(command, args, options = {}) {
   });
 }
 
+async function pathExists(file) {
+  try {
+    await access(file);
+    return true;
+  } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+function commandSucceeds(command, args, options = {}) {
+  return new Promise(resolve => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      stdio: 'ignore',
+    });
+
+    child.once('error', () => {
+      resolve(false);
+    });
+    child.once('close', code => {
+      resolve(code === 0);
+    });
+  });
+}
+
+async function checkDiscoveryRequirements(options) {
+  const missing = [];
+
+  if (!(await pathExists(options.projectRoot))) {
+    missing.push({
+      id: 'project_root',
+      message: `Project root does not exist: ${options.projectRoot}`,
+    });
+  }
+
+  if (options.fixture) {
+    const fixturePath = path.resolve(options.fixture);
+    if (!(await pathExists(fixturePath))) {
+      missing.push({
+        id: 'fixture',
+        message: `Fixture file does not exist: ${fixturePath}`,
+      });
+    }
+  } else if (!(await commandSucceeds('gh', ['--version'], { cwd: options.projectRoot }))) {
+    missing.push({
+      id: 'gh',
+      message: 'GitHub CLI is required when --fixture is not provided.',
+    });
+  }
+
+  return missing;
+}
+
+async function checkWorkerRequirements(options, selected) {
+  const missing = [];
+  const worktreePath = selected.worktree_path || options.projectRoot;
+
+  if (!(await pathExists(WORKER_TEMPLATE_PATH))) {
+    missing.push({
+      id: 'worker_prompt_template',
+      message: `Worker prompt template does not exist: ${WORKER_TEMPLATE_PATH}`,
+    });
+  }
+
+  if (!(await pathExists(worktreePath))) {
+    missing.push({
+      id: 'worktree_path',
+      message: `Worker worktree path does not exist: ${worktreePath}`,
+    });
+  }
+
+  if (!(await commandSucceeds('codex', ['--version'], { cwd: options.projectRoot }))) {
+    missing.push({
+      id: 'codex',
+      message: 'Codex CLI is required before launching a worker.',
+    });
+  }
+
+  return missing;
+}
+
 async function ghJson(args, options) {
   const stdout = await runCommand('gh', args, { cwd: options.projectRoot });
   return JSON.parse(stdout || 'null');
@@ -499,8 +583,7 @@ function renderTemplate(template, values) {
 }
 
 async function writeWorkerPrompt(projectRoot, runDir, selected) {
-  const templatePath = path.join(SUPERPOWERS_ROOT, 'skills', 'pr-automation-loop', 'worker-prompt-template.md');
-  const template = await readFile(templatePath, 'utf8');
+  const template = await readFile(WORKER_TEMPLATE_PATH, 'utf8');
   const promptPath = path.join(runDir, 'worker-prompt.md');
   const entityId = `github:${selected.repo}:pull/${selected.pr_number}`;
   const entityFile = `.superpowers/state/entities/${selected.repo.replaceAll(/[/:]/g, '-')}-pr-${selected.pr_number}.json`;
@@ -652,6 +735,15 @@ async function main() {
   }
 
   options.projectRoot = path.resolve(options.projectRoot);
+  const missingDiscoveryRequirements = await checkDiscoveryRequirements(options);
+  if (missingDiscoveryRequirements.length > 0) {
+    output({
+      status: 'requirements_failed',
+      missing_requirements: missingDiscoveryRequirements,
+    }, options);
+    return;
+  }
+
   const { lockPath } = runtimePaths(options.projectRoot);
   const { activeWorker, clearedCompletedWorker } = await reconcileActiveWorker(options.projectRoot, lockPath);
   const facts = await loadFacts(options);
@@ -696,6 +788,20 @@ async function main() {
       selected,
       worklist,
       skipped,
+    }, options);
+    return;
+  }
+
+  const missingWorkerRequirements = await checkWorkerRequirements(options, selected);
+  if (missingWorkerRequirements.length > 0) {
+    output({
+      status: 'requirements_failed',
+      worklist_count: worklist.length,
+      skipped_e2e_count: skipped.length,
+      cleared_completed_worker: clearedCompletedWorker,
+      cleared_stale_worker: clearedStaleWorker,
+      selected,
+      missing_requirements: missingWorkerRequirements,
     }, options);
     return;
   }

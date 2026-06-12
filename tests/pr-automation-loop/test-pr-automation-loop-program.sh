@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="$ROOT/scripts/pr-automation-loop.mjs"
+NODE_BIN="$(command -v node)"
 
 fail() {
   echo "[FAIL] $1" >&2
@@ -194,6 +195,30 @@ if (data.status !== 'worker_active') {
 NODE
 
 rm -f "$TMP/.superpowers/runtime/active-worker.json"
+EMPTYBIN="$TMP/emptybin"
+mkdir -p "$EMPTYBIN"
+
+PATH="$EMPTYBIN" "$NODE_BIN" "$SCRIPT" --project-root "$TMP" --fixture "$FIXTURE" --json > "$OUT"
+
+node - "$OUT" "$TMP" <<'NODE'
+const fs = require('node:fs');
+const [outPath, projectRoot] = process.argv.slice(2);
+const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
+
+function assert(condition, message) {
+  if (!condition) {
+    console.error(`[FAIL] ${message}`);
+    process.exit(1);
+  }
+}
+
+assert(data.status === 'requirements_failed', `expected requirements_failed without codex, got ${data.status}`);
+assert(data.selected?.trigger_id === 'github-pr-comment-202', `expected selected trigger to be reported, got ${data.selected?.trigger_id}`);
+assert(Array.isArray(data.missing_requirements), 'expected missing_requirements array');
+assert(data.missing_requirements.some(requirement => requirement.id === 'codex'), 'expected missing codex requirement');
+assert(!fs.existsSync(`${projectRoot}/.superpowers/runtime/active-worker.json`), 'requirements failure created active-worker.json');
+NODE
+
 FAKEBIN="$TMP/fakebin"
 mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/codex" <<'BASH'

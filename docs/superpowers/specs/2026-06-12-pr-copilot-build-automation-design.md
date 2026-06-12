@@ -4,7 +4,7 @@
 
 Design a program-driven Codex automation loop that watches open pull requests created by or assigned to the user, then responds to Copilot review feedback and non-e2e build failures with one normal Codex worker at a time.
 
-The automation runtime is a coordinator program, not a skill and not the repair worker itself. On each wake-up the program reconciles GitHub, Buildkite, and local loop state; derives the current worklist; and starts exactly one Codex worker only when no worker is already active. The `pr-automation-loop` skill is a policy/reference layer for the program and worker prompts, not the execution engine.
+The automation runtime is a coordinator program, not a skill and not the repair worker itself. On each wake-up the program reconciles GitHub, Buildkite, and local loop state; derives the current worklist; verifies launch requirements; and starts exactly one Codex worker only when no worker is already active. The worker prompt template is a program resource under `scripts/pr-automation-loop/`, not a discoverable skill.
 
 The core model is:
 
@@ -54,8 +54,9 @@ Each wake-up:
 4. Fetches PR review comments, PR conversation comments, check runs, and linked Buildkite build/job data.
 5. Reconciles current external state against saved entity cursors and loop summaries.
 6. Derives an in-memory worklist.
-7. If no worker is active, launches one worker for the highest-priority work item.
-8. If a worker is active, records compact observations only when useful and exits without launching another worker.
+7. Checks worker launch requirements, including the prompt template, target worktree path, and Codex CLI availability.
+8. If no worker is active and requirements pass, launches one worker for the highest-priority work item.
+9. If a worker is active, records compact observations only when useful and exits without launching another worker.
 
 The coordinator does not directly edit application code. It only starts the worker process for one selected trigger.
 
