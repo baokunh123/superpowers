@@ -44,7 +44,7 @@ Before changing code:
 - Push to the PR branch only after validation passes and the pre-push SHA guard is satisfied.
 - Reply to the original GitHub thread or PR conversation with a concise summary, validation evidence, and hidden `<!-- codex-loop trigger=<trigger id> sha=<head sha> outcome=<outcome> -->` marker for deduplication.
 - Use loop-state as the final persistence step: write one factual loop summary and update entity/worktree facts.
-- Loop summaries must not include `Next Step:`, `Next Trigger:`, waiting instructions, or a persistent queue.
+- Loop summaries must not include planner-style next-action fields, waiting instructions, or a persistent queue.
 - If blocked, do not guess. Mark the loop summary as `escalated` or `failed` with a concrete reason.
 
 ## Expected completion
