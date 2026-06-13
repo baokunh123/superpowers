@@ -60,9 +60,10 @@ Each wake-up:
 4. Fetches PR review comments, PR conversation comments, check runs, and linked Buildkite build/job data.
 5. Reconciles current external state against saved entity cursors and loop summaries.
 6. Derives an in-memory worklist.
-7. Checks worker launch requirements, including the prompt template, target worktree path, and Codex CLI availability.
-8. If no worker is active and requirements pass, launches one worker for the highest-priority work item.
-9. If a worker is active, records compact observations only when useful and exits without launching another worker.
+7. Checks worker launch requirements, including the prompt template, Git availability, PR branch identity, and Codex CLI availability.
+8. Acquires the single-worker lock, resolves the PR worktree, and creates a linked worktree when no matching worktree exists.
+9. If no worker is active and requirements pass, launches one worker for the highest-priority work item in the PR worktree.
+10. If a worker is active, records compact observations only when useful and exits without launching another worker.
 
 The coordinator does not directly edit application code. It only starts the worker process for one selected trigger.
 
@@ -295,6 +296,30 @@ Example:
 ```
 
 If the lock exists, the coordinator does not start another worker. If the lock appears stale, the coordinator checks external state and local process/run evidence before clearing it.
+
+## Worktree Resolution
+
+The coordinator may run from the main checkout. The worker must run from a PR-specific worktree.
+
+For the selected trigger, the coordinator resolves the worker directory in this order:
+
+1. Use `worktree_path` from discovered facts when present and existing.
+2. Search `git worktree list --porcelain` for a linked worktree whose branch matches the PR branch.
+3. Create a linked worktree next to the main checkout when no matching worktree exists.
+
+The default created path is:
+
+```text
+<parent-of-project-root>/<project-name>-wt-pr-<pr-number>-<branch-slug>
+```
+
+For example, `/Users/bhuang/workspace/mortgage` with PR 123 on `feature/foo` creates:
+
+```text
+/Users/bhuang/workspace/mortgage-wt-pr-123-feature-foo
+```
+
+The coordinator creates the worktree after acquiring `active-worker.json`, so concurrent wakes do not create competing worktrees. It records the result as `worktree_resolved` with `action: "provided" | "existing" | "created"`.
 
 ## Audit Log
 

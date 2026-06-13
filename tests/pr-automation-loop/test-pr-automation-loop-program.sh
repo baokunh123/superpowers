@@ -19,6 +19,8 @@ pass() {
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+PROJECT_ROOT="$TMP/project"
+EXPECTED_WORKTREE="$TMP/project-wt-pr-12-feature-pr-loop"
 FIXTURE="$TMP/facts.json"
 OUT="$TMP/out.json"
 LOG_STDOUT_OUT="$TMP/log-stdout.jsonl"
@@ -26,7 +28,16 @@ CODEX_HOME_DIR="$TMP/codex-home"
 STATE_ROOT="$CODEX_HOME_DIR/superpowers/state-index/mortgage"
 RUNTIME_ROOT="$CODEX_HOME_DIR/superpowers/runtime/mortgage"
 AUDIT_LOG="$RUNTIME_ROOT/audit.jsonl"
-COMMON_ARGS=(--project-root "$TMP" --repo-id mortgage --fixture "$FIXTURE")
+COMMON_ARGS=(--project-root "$PROJECT_ROOT" --repo-id mortgage --fixture "$FIXTURE")
+
+mkdir -p "$PROJECT_ROOT"
+git -C "$PROJECT_ROOT" init -q
+git -C "$PROJECT_ROOT" config user.email "codex@example.com"
+git -C "$PROJECT_ROOT" config user.name "Codex"
+printf "# test repo\n" > "$PROJECT_ROOT/README.md"
+git -C "$PROJECT_ROOT" add README.md
+git -C "$PROJECT_ROOT" commit -q -m "Initial commit"
+git -C "$PROJECT_ROOT" branch feature/pr-loop
 
 cat > "$FIXTURE" <<'JSON'
 {
@@ -84,7 +95,7 @@ JSON
 
 CODEX_HOME="$CODEX_HOME_DIR" node "$SCRIPT" "${COMMON_ARGS[@]}" --dry-run --json > "$OUT"
 
-node - "$OUT" "$TMP" "$STATE_ROOT" "$RUNTIME_ROOT" "$AUDIT_LOG" <<'NODE'
+node - "$OUT" "$PROJECT_ROOT" "$STATE_ROOT" "$RUNTIME_ROOT" "$AUDIT_LOG" <<'NODE'
 const fs = require('node:fs');
 const [outPath, projectRoot, stateRoot, runtimeRoot, auditLog] = process.argv.slice(2);
 const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
@@ -208,7 +219,7 @@ JSON
 
 CODEX_HOME="$CODEX_HOME_DIR" node "$SCRIPT" "${COMMON_ARGS[@]}" --dry-run --json > "$OUT"
 
-node - "$OUT" "$TMP" "$RUNTIME_ROOT" "$AUDIT_LOG" <<'NODE'
+node - "$OUT" "$PROJECT_ROOT" "$RUNTIME_ROOT" "$AUDIT_LOG" <<'NODE'
 const fs = require('node:fs');
 const [outPath, projectRoot, runtimeRoot, auditLog] = process.argv.slice(2);
 const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
@@ -266,7 +277,7 @@ mkdir -p "$EMPTYBIN"
 
 CODEX_HOME="$CODEX_HOME_DIR" PATH="$EMPTYBIN" "$NODE_BIN" "$SCRIPT" "${COMMON_ARGS[@]}" --json > "$OUT"
 
-node - "$OUT" "$TMP" "$RUNTIME_ROOT" "$AUDIT_LOG" <<'NODE'
+node - "$OUT" "$PROJECT_ROOT" "$RUNTIME_ROOT" "$AUDIT_LOG" <<'NODE'
 const fs = require('node:fs');
 const [outPath, projectRoot, runtimeRoot, auditLog] = process.argv.slice(2);
 const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
@@ -327,11 +338,12 @@ chmod +x "$FAKEBIN/codex"
 
 CODEX_HOME="$CODEX_HOME_DIR" PATH="$FAKEBIN:$PATH" node "$SCRIPT" "${COMMON_ARGS[@]}" --json > "$OUT"
 
-node - "$OUT" "$TMP" "$RUNTIME_ROOT" "$STATE_ROOT" "$AUDIT_LOG" <<'NODE'
+node - "$OUT" "$PROJECT_ROOT" "$RUNTIME_ROOT" "$STATE_ROOT" "$AUDIT_LOG" "$EXPECTED_WORKTREE" <<'NODE'
 const fs = require('node:fs');
 const path = require('node:path');
-const [outPath, projectRoot, runtimeRoot, stateRoot, auditLog] = process.argv.slice(2);
+const [outPath, projectRoot, runtimeRoot, stateRoot, auditLog, expectedWorktree] = process.argv.slice(2);
 const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
+const expectedWorktreeRealpath = fs.realpathSync(expectedWorktree);
 
 function assert(condition, message) {
   if (!condition) {
@@ -351,20 +363,56 @@ const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
 assert(lock.status === 'running', `expected running lock, got ${lock.status}`);
 assert(lock.trigger_id === 'github-pr-comment-202', `expected lock trigger github-pr-comment-202, got ${lock.trigger_id}`);
 assert(Number.isInteger(lock.worker_pid), 'expected worker_pid in lock');
+assert(lock.worktree_path !== projectRoot, 'worker used the main checkout instead of a linked worktree');
+assert(fs.existsSync(path.join(lock.worktree_path, '.git')), 'linked worktree was not created');
+assert(fs.realpathSync(lock.worktree_path) === expectedWorktreeRealpath, `expected worktree ${expectedWorktree}, got ${lock.worktree_path}`);
 assert(!fs.existsSync(path.join(projectRoot, '.superpowers/runtime/active-worker.json')), 'launch created project-local runtime lock');
 
 const prompt = fs.readFileSync(path.join(lock.run_dir, 'worker-prompt.md'), 'utf8');
 assert(prompt.includes('Process exactly one trigger'), 'worker prompt was not rendered from template');
 assert(prompt.includes('github-pr-comment-202'), 'worker prompt missing selected trigger');
 assert(prompt.includes(stateRoot), 'worker prompt missing global state root');
+assert(prompt.includes(lock.worktree_path), 'worker prompt missing linked worktree path');
 
 const auditEvents = fs.readFileSync(auditLog, 'utf8').trim().split(/\n+/).map(line => JSON.parse(line));
+assert(auditEvents.some(event => event.event === 'worktree_resolved' && event.action === 'created' && event.worktree_path === lock.worktree_path), 'expected created worktree audit event');
 assert(auditEvents.some(event => event.event === 'worker_launching' && event.selected?.trigger_id === 'github-pr-comment-202'), 'expected worker_launching audit event');
 const launchedEvents = auditEvents.filter(event => event.event === 'worker_launched');
 const latestLaunchedEvent = launchedEvents[launchedEvents.length - 1];
 assert(latestLaunchedEvent.selected?.trigger_id === 'github-pr-comment-202', `expected worker_launched trigger github-pr-comment-202, got ${latestLaunchedEvent.selected?.trigger_id}`);
 assert(Number.isInteger(latestLaunchedEvent.worker_pid), 'expected worker_pid in worker_launched audit event');
 assert(latestLaunchedEvent.run_dir === lock.run_dir, `expected audit run_dir ${lock.run_dir}, got ${latestLaunchedEvent.run_dir}`);
+NODE
+
+rm -f "$RUNTIME_ROOT/active-worker.json"
+CODEX_HOME="$CODEX_HOME_DIR" PATH="$FAKEBIN:$PATH" node "$SCRIPT" "${COMMON_ARGS[@]}" --json > "$OUT"
+
+node - "$OUT" "$RUNTIME_ROOT" "$AUDIT_LOG" "$EXPECTED_WORKTREE" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+const [outPath, runtimeRoot, auditLog, expectedWorktree] = process.argv.slice(2);
+const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
+const expectedWorktreeRealpath = fs.realpathSync(expectedWorktree);
+
+function assert(condition, message) {
+  if (!condition) {
+    console.error(`[FAIL] ${message}`);
+    process.exit(1);
+  }
+}
+
+assert(data.status === 'launched', `expected launched status for existing worktree, got ${data.status}`);
+assert(fs.realpathSync(data.selected?.worktree_path) === expectedWorktreeRealpath, `expected selected worktree ${expectedWorktree}, got ${data.selected?.worktree_path}`);
+
+const lock = JSON.parse(fs.readFileSync(path.join(runtimeRoot, 'active-worker.json'), 'utf8'));
+assert(fs.realpathSync(lock.worktree_path) === expectedWorktreeRealpath, `expected existing lock worktree ${expectedWorktree}, got ${lock.worktree_path}`);
+assert(lock.worktree_action === 'existing', `expected existing worktree action, got ${lock.worktree_action}`);
+
+const auditEvents = fs.readFileSync(auditLog, 'utf8').trim().split(/\n+/).map(line => JSON.parse(line));
+const worktreeEvents = auditEvents.filter(event => event.event === 'worktree_resolved');
+const latestWorktreeEvent = worktreeEvents[worktreeEvents.length - 1];
+assert(latestWorktreeEvent.action === 'existing', `expected existing worktree audit action, got ${latestWorktreeEvent.action}`);
+assert(fs.realpathSync(latestWorktreeEvent.worktree_path) === expectedWorktreeRealpath, `expected existing audit worktree ${expectedWorktree}, got ${latestWorktreeEvent.worktree_path}`);
 NODE
 
 pass "pr-automation-loop program derives work, reconciles state, and respects active worker lock"

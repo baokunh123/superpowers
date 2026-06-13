@@ -400,7 +400,6 @@ async function checkDiscoveryRequirements(options) {
 
 async function checkWorkerRequirements(options, selected) {
   const missing = [];
-  const worktreePath = selected.worktree_path || options.projectRoot;
 
   if (!(await pathExists(WORKER_TEMPLATE_PATH))) {
     missing.push({
@@ -409,11 +408,33 @@ async function checkWorkerRequirements(options, selected) {
     });
   }
 
-  if (!(await pathExists(worktreePath))) {
-    missing.push({
-      id: 'worktree_path',
-      message: `Worker worktree path does not exist: ${worktreePath}`,
-    });
+  if (selected.worktree_path) {
+    const worktreePath = resolveWorktreePath(options, selected.worktree_path);
+    if (!(await pathExists(worktreePath))) {
+      missing.push({
+        id: 'worktree_path',
+        message: `Worker worktree path does not exist: ${worktreePath}`,
+      });
+    }
+  } else {
+    if (!selected.branch) {
+      missing.push({
+        id: 'git_branch',
+        message: 'PR branch is required to create or find a linked worktree.',
+      });
+    }
+
+    if (!(await commandSucceeds('git', ['--version'], { cwd: options.projectRoot }))) {
+      missing.push({
+        id: 'git',
+        message: 'Git is required to create or find a linked PR worktree.',
+      });
+    } else if (!(await commandSucceeds('git', ['rev-parse', '--is-inside-work-tree'], { cwd: options.projectRoot }))) {
+      missing.push({
+        id: 'git_repository',
+        message: `Project root must be a Git repository to create or find a linked worktree: ${options.projectRoot}`,
+      });
+    }
   }
 
   if (!(await commandSucceeds('codex', ['--version'], { cwd: options.projectRoot }))) {
@@ -424,6 +445,137 @@ async function checkWorkerRequirements(options, selected) {
   }
 
   return missing;
+}
+
+function resolveWorktreePath(options, worktreePath) {
+  if (path.isAbsolute(worktreePath)) return worktreePath;
+  return path.resolve(options.projectRoot, worktreePath);
+}
+
+function worktreePathFor(options, selected) {
+  const branchSlug = normalizeId(selected.branch || selected.trigger_id);
+  return path.join(
+    path.dirname(options.projectRoot),
+    `${path.basename(options.projectRoot)}-wt-pr-${selected.pr_number}-${branchSlug}`,
+  );
+}
+
+function worktreeBranchMatches(recordBranch, selectedBranch) {
+  if (!recordBranch || !selectedBranch) return false;
+  return recordBranch === `refs/heads/${selectedBranch}`
+    || recordBranch === `refs/remotes/origin/${selectedBranch}`
+    || recordBranch.endsWith(`/${selectedBranch}`);
+}
+
+async function listGitWorktrees(projectRoot) {
+  const stdout = await runCommand('git', ['worktree', 'list', '--porcelain'], { cwd: projectRoot });
+  const records = [];
+  let current = null;
+
+  for (const line of stdout.split('\n')) {
+    if (!line.trim()) continue;
+    if (line.startsWith('worktree ')) {
+      current = { path: line.slice('worktree '.length) };
+      records.push(current);
+    } else if (current && line.startsWith('HEAD ')) {
+      current.head = line.slice('HEAD '.length);
+    } else if (current && line.startsWith('branch ')) {
+      current.branch = line.slice('branch '.length);
+    }
+  }
+
+  return records;
+}
+
+async function refExists(projectRoot, ref) {
+  return commandSucceeds('git', ['rev-parse', '--verify', '--quiet', ref], { cwd: projectRoot });
+}
+
+async function fetchOriginBranch(projectRoot, branch) {
+  try {
+    await runCommand('git', ['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`], { cwd: projectRoot });
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+class WorktreePreparationError extends Error {
+  constructor(requirement) {
+    super(requirement.message);
+    this.name = 'WorktreePreparationError';
+    this.requirement = requirement;
+  }
+}
+
+async function ensureWorkerWorktree(options, selected) {
+  if (selected.worktree_path) {
+    const worktreePath = resolveWorktreePath(options, selected.worktree_path);
+    if (!(await pathExists(worktreePath))) {
+      throw new WorktreePreparationError({
+        id: 'worktree_path',
+        message: `Worker worktree path does not exist: ${worktreePath}`,
+      });
+    }
+    return {
+      action: 'provided',
+      worktree_path: worktreePath,
+      branch: selected.branch || null,
+      selected: { ...selected, worktree_path: worktreePath },
+    };
+  }
+
+  const existingWorktree = (await listGitWorktrees(options.projectRoot))
+    .find(record => record.path !== options.projectRoot && worktreeBranchMatches(record.branch, selected.branch));
+  if (existingWorktree) {
+    return {
+      action: 'existing',
+      worktree_path: existingWorktree.path,
+      branch: selected.branch,
+      selected: { ...selected, worktree_path: existingWorktree.path },
+    };
+  }
+
+  const worktreePath = worktreePathFor(options, selected);
+  if (await pathExists(worktreePath)) {
+    throw new WorktreePreparationError({
+      id: 'worktree_path',
+      message: `Candidate worktree path already exists but is not registered with git worktree: ${worktreePath}`,
+    });
+  }
+
+  const localRef = `refs/heads/${selected.branch}`;
+  const remoteRef = `refs/remotes/origin/${selected.branch}`;
+  let args;
+
+  if (await refExists(options.projectRoot, localRef)) {
+    args = ['worktree', 'add', worktreePath, selected.branch];
+  } else {
+    await fetchOriginBranch(options.projectRoot, selected.branch);
+    if (!(await refExists(options.projectRoot, remoteRef))) {
+      throw new WorktreePreparationError({
+        id: 'git_branch',
+        message: `Could not find PR branch locally or at origin/${selected.branch}.`,
+      });
+    }
+    args = ['worktree', 'add', '-b', selected.branch, worktreePath, `origin/${selected.branch}`];
+  }
+
+  try {
+    await runCommand('git', args, { cwd: options.projectRoot });
+  } catch (error) {
+    throw new WorktreePreparationError({
+      id: 'worktree_create',
+      message: `Failed to create linked worktree at ${worktreePath}: ${error.message}`,
+    });
+  }
+
+  return {
+    action: 'created',
+    worktree_path: worktreePath,
+    branch: selected.branch,
+    selected: { ...selected, worktree_path: worktreePath },
+  };
 }
 
 async function ghJson(args, options) {
@@ -804,7 +956,7 @@ async function launchWorker(options, selected) {
     repo: selected.repo,
     pr_number: selected.pr_number,
     trigger_id: selected.trigger_id,
-    worktree_path: selected.worktree_path || projectRoot,
+    worktree_path: selected.worktree_path || null,
     run_dir: runDir,
   };
 
@@ -818,7 +970,22 @@ async function launchWorker(options, selected) {
   }
 
   try {
-    const { promptPath, worktreePath } = await writeWorkerPrompt(options, runDir, selected);
+    const worktree = await ensureWorkerWorktree(options, selected);
+    const preparedSelected = worktree.selected;
+    await appendAudit(options, 'worktree_resolved', {
+      action: worktree.action,
+      branch: worktree.branch,
+      worktree_path: worktree.worktree_path,
+      selected: summarizeWorkItem(preparedSelected),
+    });
+    await updateLock(lockPath, {
+      ...lock,
+      status: 'starting',
+      worktree_path: worktree.worktree_path,
+      worktree_action: worktree.action,
+    });
+
+    const { promptPath, worktreePath } = await writeWorkerPrompt(options, runDir, preparedSelected);
     const finalPath = path.join(runDir, 'final.md');
     const stdoutPath = path.join(runDir, 'stdout.jsonl');
     const stderrPath = path.join(runDir, 'stderr.log');
@@ -854,6 +1021,8 @@ async function launchWorker(options, selected) {
     await updateLock(lockPath, {
       ...lock,
       status: 'running',
+      worktree_path: worktreePath,
+      worktree_action: worktree.action,
       worker_pid: child.pid,
       worker_started_at: new Date().toISOString(),
     });
@@ -863,7 +1032,7 @@ async function launchWorker(options, selected) {
 
     return {
       status: 'launched',
-      selected,
+      selected: preparedSelected,
       lock_path: lockPath,
       state_root: options.stateRoot,
       runtime_root: options.runtimeRoot,
@@ -1061,7 +1230,7 @@ async function main() {
     });
     const launchResult = await launchWorker(options, selected);
     await appendAudit(options, 'worker_launched', {
-      selected: summarizeWorkItem(selected),
+      selected: summarizeWorkItem(launchResult.selected),
       lock_path: launchResult.lock_path,
       run_dir: launchResult.run_dir,
       final_path: launchResult.final_path,
@@ -1082,6 +1251,26 @@ async function main() {
         status: 'worker_active',
         active_worker: activeWorkerAfterRace,
         lock_path: lockPath,
+      }, options);
+      return;
+    }
+    if (error instanceof WorktreePreparationError) {
+      await appendAudit(options, 'requirements_failed', {
+        phase: 'worktree',
+        worklist_count: worklist.length,
+        skipped_e2e_count: skipped.length,
+        selected: summarizeWorkItem(selected),
+        missing_requirements: [error.requirement],
+      });
+      output({
+        ...resultBase(options),
+        status: 'requirements_failed',
+        worklist_count: worklist.length,
+        skipped_e2e_count: skipped.length,
+        cleared_completed_worker: clearedCompletedWorker,
+        cleared_stale_worker: clearedStaleWorker,
+        selected,
+        missing_requirements: [error.requirement],
       }, options);
       return;
     }

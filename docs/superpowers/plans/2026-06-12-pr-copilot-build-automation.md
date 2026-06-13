@@ -49,6 +49,8 @@
 - [x] Preserve an active lock while the recorded worker PID is still alive.
 - [x] Clear completed locks when the run directory has completion evidence.
 - [x] Handle lock creation races as `worker_active`.
+- [x] Resolve an existing PR worktree or create a linked worktree after acquiring the worker lock.
+- [x] Launch the worker in the PR worktree, not the main checkout.
 
 ### Task 5: Requirements Preflight
 
@@ -62,6 +64,7 @@
 - [x] Write append-only coordinator events to `$CODEX_HOME/superpowers/runtime/<repo-id>/audit.jsonl`.
 - [x] Record wake, facts-loaded, worklist-derived, no-work, dry-run, active-worker, requirement-failure, launch, launch-failure, stale-lock-clear, and completed-worker-clear events.
 - [x] Include trigger identity, PR/check metadata, counts, run artifact paths, and worker completion evidence.
+- [x] Record worktree resolution as `worktree_resolved`.
 - [x] Do not write full Copilot comment bodies into the audit log.
 - [x] Support `--log-stdout` for mirroring audit events to stdout during interactive runs.
 
