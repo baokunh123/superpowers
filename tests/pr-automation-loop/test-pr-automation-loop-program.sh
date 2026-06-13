@@ -22,13 +22,19 @@ trap 'rm -rf "$TMP"' EXIT
 PROJECT_ROOT="$TMP/project"
 EXPECTED_WORKTREE="$TMP/project-wt-pr-12-feature-pr-loop"
 FIXTURE="$TMP/facts.json"
+CUTOFF_FIXTURE="$TMP/cutoff-facts.json"
 OUT="$TMP/out.json"
+CUTOFF_OUT="$TMP/cutoff-out.json"
 LOG_STDOUT_OUT="$TMP/log-stdout.jsonl"
 CODEX_HOME_DIR="$TMP/codex-home"
 STATE_ROOT="$CODEX_HOME_DIR/superpowers/state-index/mortgage"
 RUNTIME_ROOT="$CODEX_HOME_DIR/superpowers/runtime/mortgage"
 AUDIT_LOG="$RUNTIME_ROOT/audit.jsonl"
+CUTOFF_STATE_ROOT="$CODEX_HOME_DIR/superpowers/state-index/cutoff"
+CUTOFF_RUNTIME_ROOT="$CODEX_HOME_DIR/superpowers/runtime/cutoff"
+CUTOFF_AUDIT_LOG="$CUTOFF_RUNTIME_ROOT/audit.jsonl"
 COMMON_ARGS=(--project-root "$PROJECT_ROOT" --repo-id mortgage --fixture "$FIXTURE")
+CUTOFF_ARGS=(--project-root "$PROJECT_ROOT" --repo-id cutoff --fixture "$CUTOFF_FIXTURE")
 
 mkdir -p "$PROJECT_ROOT"
 git -C "$PROJECT_ROOT" init -q
@@ -92,6 +98,124 @@ cat > "$FIXTURE" <<'JSON'
   ]
 }
 JSON
+
+cat > "$CUTOFF_FIXTURE" <<'JSON'
+{
+  "pull_requests": [
+    {
+      "repo": "better/mortgage-api",
+      "number": 18,
+      "url": "https://github.com/better/mortgage-api/pull/18",
+      "head_sha": "def456",
+      "branch": "feature/pr-loop",
+      "base": "main",
+      "is_draft": false,
+      "review_comments": [
+        {
+          "id": 401,
+          "user": "github-copilot[bot]",
+          "created_at": "2026-06-12T23:59:00.000Z",
+          "body": "Old review comment should be ignored.",
+          "path": "app/models/state.ts",
+          "line": 44,
+          "url": "https://github.com/better/mortgage-api/pull/18#discussion_r401"
+        },
+        {
+          "id": 402,
+          "user": "github-copilot[bot]",
+          "created_at": "2026-06-13T00:01:00.000Z",
+          "body": "New review comment should be processed.",
+          "path": "app/models/state.ts",
+          "line": 45,
+          "url": "https://github.com/better/mortgage-api/pull/18#discussion_r402"
+        }
+      ],
+      "comments": [
+        {
+          "id": 501,
+          "user": "github-copilot[bot]",
+          "created_at": "2026-06-12T23:58:00.000Z",
+          "body": "Old PR comment should be ignored.",
+          "url": "https://github.com/better/mortgage-api/pull/18#issuecomment-501"
+        },
+        {
+          "id": 502,
+          "user": "github-copilot[bot]",
+          "created_at": "2026-06-13T00:02:00.000Z",
+          "body": "New PR comment should be processed.",
+          "url": "https://github.com/better/mortgage-api/pull/18#issuecomment-502"
+        }
+      ],
+      "checks": [
+        {
+          "id": 603,
+          "name": "unit tests",
+          "conclusion": "failure",
+          "details_url": "https://buildkite.com/better/mortgage-api/builds/154655#job-603"
+        }
+      ]
+    }
+  ]
+}
+JSON
+
+CODEX_HOME="$CODEX_HOME_DIR" node "$SCRIPT" "${CUTOFF_ARGS[@]}" --set-comment-created-after "2026-06-13T00:00:00.000Z" --dry-run --json > "$CUTOFF_OUT"
+
+node - "$CUTOFF_OUT" "$CUTOFF_STATE_ROOT" "$CUTOFF_AUDIT_LOG" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+const [outPath, stateRoot, auditLog] = process.argv.slice(2);
+const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
+
+function assert(condition, message) {
+  if (!condition) {
+    console.error(`[FAIL] ${message}`);
+    process.exit(1);
+  }
+}
+
+assert(data.status === 'dry_run', `expected cutoff dry_run, got ${data.status}`);
+assert(data.comment_created_after === '2026-06-13T00:00:00.000Z', `expected cutoff timestamp, got ${data.comment_created_after}`);
+assert(data.comment_created_after_persisted === true, 'expected cutoff baseline to be persisted');
+assert(data.worklist_count === 3, `expected 2 new comments plus build failure, got ${data.worklist_count}`);
+assert(data.skipped_comment_cutoff_count === 2, `expected 2 comments skipped by cutoff, got ${data.skipped_comment_cutoff_count}`);
+assert(data.selected?.trigger_id === 'github-review-comment-402', `expected new review comment first, got ${data.selected?.trigger_id}`);
+assert(data.worklist.some(item => item.trigger_id === 'github-pr-comment-502'), 'expected new PR comment in worklist');
+assert(data.worklist.some(item => item.trigger_id === 'github-check-603'), 'expected build failure to remain in worklist');
+assert(!data.worklist.some(item => item.trigger_id === 'github-review-comment-401'), 'old review comment was not filtered');
+assert(!data.worklist.some(item => item.trigger_id === 'github-pr-comment-501'), 'old PR comment was not filtered');
+
+const config = JSON.parse(fs.readFileSync(path.join(stateRoot, 'automation.json'), 'utf8'));
+assert(config.comment_created_after === '2026-06-13T00:00:00.000Z', `expected persisted cutoff, got ${config.comment_created_after}`);
+
+const auditEvents = fs.readFileSync(auditLog, 'utf8').trim().split(/\n+/).map(line => JSON.parse(line));
+const worklistEvent = auditEvents.find(event => event.event === 'worklist_derived');
+assert(worklistEvent.comment_created_after === '2026-06-13T00:00:00.000Z', `expected audit cutoff, got ${worklistEvent.comment_created_after}`);
+assert(worklistEvent.skipped_comment_cutoff_count === 2, `expected audit skipped cutoff count 2, got ${worklistEvent.skipped_comment_cutoff_count}`);
+assert(worklistEvent.skipped.some(item => item.reason === 'comment_created_before_cutoff' && item.trigger_id === 'github-review-comment-401'), 'expected skipped old review comment in audit');
+NODE
+
+CODEX_HOME="$CODEX_HOME_DIR" node "$SCRIPT" "${CUTOFF_ARGS[@]}" --dry-run --json > "$CUTOFF_OUT"
+
+node - "$CUTOFF_OUT" <<'NODE'
+const fs = require('node:fs');
+const [outPath] = process.argv.slice(2);
+const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
+
+function assert(condition, message) {
+  if (!condition) {
+    console.error(`[FAIL] ${message}`);
+    process.exit(1);
+  }
+}
+
+assert(data.status === 'dry_run', `expected persisted cutoff dry_run, got ${data.status}`);
+assert(data.comment_created_after === '2026-06-13T00:00:00.000Z', `expected persisted cutoff timestamp, got ${data.comment_created_after}`);
+assert(data.comment_created_after_persisted === false, 'did not expect second run to persist cutoff again');
+assert(data.worklist_count === 3, `expected persisted cutoff worklist count 3, got ${data.worklist_count}`);
+assert(data.skipped_comment_cutoff_count === 2, `expected persisted cutoff skip count 2, got ${data.skipped_comment_cutoff_count}`);
+assert(data.selected?.trigger_id === 'github-review-comment-402', `expected persisted cutoff selected new review, got ${data.selected?.trigger_id}`);
+NODE
 
 CODEX_HOME="$CODEX_HOME_DIR" node "$SCRIPT" "${COMMON_ARGS[@]}" --dry-run --json > "$OUT"
 

@@ -34,10 +34,12 @@
 - [x] Derive work items from unresolved Copilot review comments, Copilot PR comments, and failed non-e2e checks.
 - [x] Ignore failures whose normalized name contains `e2e tests`.
 - [x] Sort work by review comments, then PR comments, then build failures.
+- [x] Support a persisted `comment_created_after` baseline so old PR/review comments are skipped.
 
 ### Task 3: State Reconciliation
 
 - [x] Read handled trigger markers from `$CODEX_HOME/superpowers/state-index/<repo-id>/loops/*.md`.
+- [x] Read coordinator policy from `$CODEX_HOME/superpowers/state-index/<repo-id>/automation.json`.
 - [x] Read handled GitHub reply markers from PR/comment bodies.
 - [x] Treat `pushed`, `skipped`, and `escalated` as handled outcomes.
 - [x] Treat `failed` as a completed worker outcome for lock cleanup, but not as a handled trigger.

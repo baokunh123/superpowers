@@ -29,6 +29,10 @@ Options:
   --repo-id <id>          Stable local state id. Defaults to project root name.
   --state-root <path>     Override durable loop-state root.
   --runtime-root <path>   Override automation runtime root.
+  --comment-created-after <iso|now>
+                         Ignore Copilot PR/review comments created at or before this time.
+  --set-comment-created-after <iso|now>
+                         Persist the comment cutoff under state root and use it.
   --include-drafts        Allow draft PRs to produce work items.
   --dry-run               Derive work without creating a lock or launching Codex.
   --json                  Emit JSON output.
@@ -45,6 +49,9 @@ function parseArgs(argv) {
     repoId: null,
     stateRoot: null,
     runtimeRoot: null,
+    commentCreatedAfter: null,
+    setCommentCreatedAfter: null,
+    commentCreatedAfterPersisted: false,
     includeDrafts: false,
     dryRun: false,
     json: false,
@@ -71,6 +78,12 @@ function parseArgs(argv) {
         break;
       case '--runtime-root':
         options.runtimeRoot = argv[++index];
+        break;
+      case '--comment-created-after':
+        options.commentCreatedAfter = argv[++index];
+        break;
+      case '--set-comment-created-after':
+        options.setCommentCreatedAfter = argv[++index];
         break;
       case '--include-drafts':
         options.includeDrafts = true;
@@ -125,6 +138,75 @@ function resolveStateRoots(options) {
   };
 }
 
+function normalizeTimestampOption(value, label) {
+  const raw = String(value || '').trim();
+  if (!raw) {
+    throw new Error(`${label} requires an ISO timestamp or "now".`);
+  }
+  if (normalizeName(raw) === 'now') {
+    return new Date().toISOString();
+  }
+
+  const date = new Date(raw);
+  if (!Number.isFinite(date.getTime())) {
+    throw new Error(`${label} must be an ISO timestamp or "now": ${value}`);
+  }
+  return date.toISOString();
+}
+
+function automationConfigPath(options) {
+  return path.join(options.stateRoot, 'automation.json');
+}
+
+async function readAutomationConfig(options) {
+  try {
+    return await readJson(automationConfigPath(options));
+  } catch (error) {
+    if (error.code === 'ENOENT') return {};
+    throw error;
+  }
+}
+
+async function writeAutomationConfig(options, config) {
+  await mkdir(options.stateRoot, { recursive: true });
+  await writeFile(automationConfigPath(options), `${JSON.stringify(config, null, 2)}\n`);
+}
+
+async function applyAutomationConfig(options) {
+  const config = await readAutomationConfig(options);
+
+  if (options.setCommentCreatedAfter) {
+    const commentCreatedAfter = normalizeTimestampOption(
+      options.setCommentCreatedAfter,
+      '--set-comment-created-after',
+    );
+    await writeAutomationConfig(options, {
+      ...config,
+      version: 1,
+      comment_created_after: commentCreatedAfter,
+      updated_at: new Date().toISOString(),
+    });
+    options.commentCreatedAfter = commentCreatedAfter;
+    options.commentCreatedAfterPersisted = true;
+    return;
+  }
+
+  if (options.commentCreatedAfter) {
+    options.commentCreatedAfter = normalizeTimestampOption(
+      options.commentCreatedAfter,
+      '--comment-created-after',
+    );
+    return;
+  }
+
+  if (config.comment_created_after) {
+    options.commentCreatedAfter = normalizeTimestampOption(
+      config.comment_created_after,
+      'automation.json comment_created_after',
+    );
+  }
+}
+
 function isE2EName(value) {
   return normalizeName(value).includes(E2E_NAME);
 }
@@ -137,6 +219,10 @@ function userLogin(value) {
 
 function isCopilot(value) {
   return userLogin(value) === COPILOT_LOGIN;
+}
+
+function commentCreatedAt(comment) {
+  return comment.created_at || comment.createdAt || comment.created || null;
 }
 
 function repoName(pr) {
@@ -201,11 +287,42 @@ function pushIfUnhandled(worklist, handledTriggers, item) {
   }
 }
 
+function commentCutoffSkipReason(comment, commentCreatedAfterMs) {
+  if (commentCreatedAfterMs === null) return null;
+
+  const createdAt = commentCreatedAt(comment);
+  if (!createdAt) return 'comment_created_at_missing';
+
+  const createdAtMs = Date.parse(createdAt);
+  if (!Number.isFinite(createdAtMs)) return 'comment_created_at_invalid';
+  if (createdAtMs <= commentCreatedAfterMs) return 'comment_created_before_cutoff';
+
+  return null;
+}
+
+function pushSkippedComment(skipped, pr, type, triggerId, comment, reason) {
+  skipped.push({
+    type,
+    trigger_id: triggerId,
+    repo: repoName(pr),
+    pr_number: pr.number,
+    reason,
+    external_id: comment.id || comment.databaseId,
+    created_at: commentCreatedAt(comment),
+    path: comment.path || null,
+    line: comment.line || comment.originalLine || null,
+    url: comment.url || comment.html_url || null,
+  });
+}
+
 function deriveWorklist(facts, options = {}) {
   const worklist = [];
   const skipped = [];
   const prs = facts.pull_requests || facts.prs || [];
   const handledTriggers = options.handledTriggers || new Set();
+  const commentCreatedAfterMs = options.commentCreatedAfter
+    ? Date.parse(options.commentCreatedAfter)
+    : null;
 
   for (const pr of prs) {
     if (normalizeName(pr.state) === 'closed') continue;
@@ -215,9 +332,16 @@ function deriveWorklist(facts, options = {}) {
       if (!isCopilot(comment.user || comment.author)) continue;
       if (comment.resolved === true || comment.isResolved === true) continue;
       const id = comment.id || comment.databaseId;
+      const triggerId = `github-review-comment-${id}`;
+      const skipReason = commentCutoffSkipReason(comment, commentCreatedAfterMs);
+      if (skipReason) {
+        pushSkippedComment(skipped, pr, 'copilot_review_comment', triggerId, comment, skipReason);
+        continue;
+      }
       pushIfUnhandled(worklist, handledTriggers, {
-        ...baseWorkItem(pr, 'copilot_review_comment', 1, `github-review-comment-${id}`),
+        ...baseWorkItem(pr, 'copilot_review_comment', 1, triggerId),
         external_id: id,
+        created_at: commentCreatedAt(comment),
         body: comment.body || '',
         path: comment.path || null,
         line: comment.line || comment.originalLine || null,
@@ -228,9 +352,16 @@ function deriveWorklist(facts, options = {}) {
     for (const comment of pr.comments || pr.conversation_comments || pr.issueComments || []) {
       if (!isCopilot(comment.user || comment.author)) continue;
       const id = comment.id || comment.databaseId;
+      const triggerId = `github-pr-comment-${id}`;
+      const skipReason = commentCutoffSkipReason(comment, commentCreatedAfterMs);
+      if (skipReason) {
+        pushSkippedComment(skipped, pr, 'copilot_pr_comment', triggerId, comment, skipReason);
+        continue;
+      }
       pushIfUnhandled(worklist, handledTriggers, {
-        ...baseWorkItem(pr, 'copilot_pr_comment', 2, `github-pr-comment-${id}`),
+        ...baseWorkItem(pr, 'copilot_pr_comment', 2, triggerId),
         external_id: id,
+        created_at: commentCreatedAt(comment),
         body: comment.body || '',
         url: comment.url || comment.html_url || null,
       });
@@ -263,6 +394,18 @@ function deriveWorklist(facts, options = {}) {
   worklist.sort((a, b) => a.priority - b.priority || String(a.trigger_id).localeCompare(String(b.trigger_id)));
 
   return { worklist, skipped };
+}
+
+function skippedReasonCount(skipped, reason) {
+  return skipped.filter(item => item.reason === reason).length;
+}
+
+function skippedE2ECount(skipped) {
+  return skippedReasonCount(skipped, 'e2e_tests');
+}
+
+function skippedCommentCutoffCount(skipped) {
+  return skipped.filter(item => String(item.reason || '').startsWith('comment_created_')).length;
 }
 
 async function collectLoopStateHandledTriggers(stateRoot) {
@@ -650,6 +793,7 @@ async function loadLiveFacts(options) {
       review_comments: reviewComments.map(comment => ({
         id: comment.id,
         user: comment.user,
+        created_at: comment.created_at,
         body: comment.body,
         path: comment.path,
         line: comment.line,
@@ -658,6 +802,7 @@ async function loadLiveFacts(options) {
       comments: comments.map(comment => ({
         id: comment.id,
         user: comment.user,
+        created_at: comment.created_at,
         body: comment.body,
         url: comment.html_url,
       })),
@@ -695,6 +840,8 @@ function resultBase(options) {
     state_root: options.stateRoot,
     runtime_root: options.runtimeRoot,
     audit_log: auditPath,
+    comment_created_after: options.commentCreatedAfter || null,
+    comment_created_after_persisted: options.commentCreatedAfterPersisted,
   };
 }
 
@@ -712,6 +859,7 @@ function summarizeWorkItem(item) {
     base: item.base,
     worktree_path: item.worktree_path,
     external_id: item.external_id,
+    created_at: item.created_at,
     path: item.path,
     line: item.line,
     url: item.url,
@@ -723,9 +871,16 @@ function summarizeWorkItem(item) {
 
 function summarizeSkippedItem(item) {
   return {
+    type: item.type,
+    trigger_id: item.trigger_id,
     repo: item.repo,
     pr_number: item.pr_number,
     reason: item.reason,
+    external_id: item.external_id,
+    created_at: item.created_at,
+    path: item.path,
+    line: item.line,
+    url: item.url,
     name: item.name,
   };
 }
@@ -764,6 +919,8 @@ async function appendAudit(options, event, fields = {}) {
     project_root: options.projectRoot,
     state_root: options.stateRoot,
     runtime_root: options.runtimeRoot,
+    comment_created_after: options.commentCreatedAfter || null,
+    comment_created_after_persisted: options.commentCreatedAfterPersisted,
     ...fields,
   };
   await writeFile(auditPath, `${JSON.stringify(entry)}\n`, { flag: 'a' });
@@ -1075,6 +1232,7 @@ async function main() {
   options.repoId = roots.repoId;
   options.stateRoot = roots.stateRoot;
   options.runtimeRoot = roots.runtimeRoot;
+  await applyAutomationConfig(options);
 
   await appendAudit(options, 'wake_started', {
     dry_run: options.dryRun,
@@ -1148,11 +1306,14 @@ async function main() {
   }
 
   const { worklist, skipped } = deriveWorklist(facts, { ...options, handledTriggers });
+  const skippedE2E = skippedE2ECount(skipped);
+  const skippedCommentCutoff = skippedCommentCutoffCount(skipped);
   const selected = worklist[0] || null;
   await appendAudit(options, 'worklist_derived', {
     handled_trigger_count: handledTriggers.size,
     worklist_count: worklist.length,
-    skipped_e2e_count: skipped.length,
+    skipped_e2e_count: skippedE2E,
+    skipped_comment_cutoff_count: skippedCommentCutoff,
     selected: summarizeWorkItem(selected),
     worklist: worklist.map(summarizeWorkItem),
     skipped: skipped.map(summarizeSkippedItem),
@@ -1161,7 +1322,8 @@ async function main() {
   if (!selected) {
     await appendAudit(options, 'no_work', {
       worklist_count: 0,
-      skipped_e2e_count: skipped.length,
+      skipped_e2e_count: skippedE2E,
+      skipped_comment_cutoff_count: skippedCommentCutoff,
       cleared_completed_worker: clearedCompletedWorker,
       cleared_stale_worker: clearedStaleWorker,
     });
@@ -1169,7 +1331,8 @@ async function main() {
       ...resultBase(options),
       status: 'no_work',
       worklist_count: 0,
-      skipped_e2e_count: skipped.length,
+      skipped_e2e_count: skippedE2E,
+      skipped_comment_cutoff_count: skippedCommentCutoff,
       cleared_completed_worker: clearedCompletedWorker,
       cleared_stale_worker: clearedStaleWorker,
     }, options);
@@ -1179,7 +1342,8 @@ async function main() {
   if (options.dryRun) {
     await appendAudit(options, 'dry_run', {
       worklist_count: worklist.length,
-      skipped_e2e_count: skipped.length,
+      skipped_e2e_count: skippedE2E,
+      skipped_comment_cutoff_count: skippedCommentCutoff,
       selected: summarizeWorkItem(selected),
       cleared_completed_worker: clearedCompletedWorker,
       cleared_stale_worker: clearedStaleWorker,
@@ -1188,7 +1352,8 @@ async function main() {
       ...resultBase(options),
       status: 'dry_run',
       worklist_count: worklist.length,
-      skipped_e2e_count: skipped.length,
+      skipped_e2e_count: skippedE2E,
+      skipped_comment_cutoff_count: skippedCommentCutoff,
       cleared_completed_worker: clearedCompletedWorker,
       cleared_stale_worker: clearedStaleWorker,
       selected,
@@ -1203,7 +1368,8 @@ async function main() {
     await appendAudit(options, 'requirements_failed', {
       phase: 'worker',
       worklist_count: worklist.length,
-      skipped_e2e_count: skipped.length,
+      skipped_e2e_count: skippedE2E,
+      skipped_comment_cutoff_count: skippedCommentCutoff,
       selected: summarizeWorkItem(selected),
       missing_requirements: missingWorkerRequirements,
       cleared_completed_worker: clearedCompletedWorker,
@@ -1213,7 +1379,8 @@ async function main() {
       ...resultBase(options),
       status: 'requirements_failed',
       worklist_count: worklist.length,
-      skipped_e2e_count: skipped.length,
+      skipped_e2e_count: skippedE2E,
+      skipped_comment_cutoff_count: skippedCommentCutoff,
       cleared_completed_worker: clearedCompletedWorker,
       cleared_stale_worker: clearedStaleWorker,
       selected,
@@ -1225,7 +1392,8 @@ async function main() {
   try {
     await appendAudit(options, 'worker_launching', {
       worklist_count: worklist.length,
-      skipped_e2e_count: skipped.length,
+      skipped_e2e_count: skippedE2E,
+      skipped_comment_cutoff_count: skippedCommentCutoff,
       selected: summarizeWorkItem(selected),
     });
     const launchResult = await launchWorker(options, selected);
@@ -1258,7 +1426,8 @@ async function main() {
       await appendAudit(options, 'requirements_failed', {
         phase: 'worktree',
         worklist_count: worklist.length,
-        skipped_e2e_count: skipped.length,
+        skipped_e2e_count: skippedE2E,
+        skipped_comment_cutoff_count: skippedCommentCutoff,
         selected: summarizeWorkItem(selected),
         missing_requirements: [error.requirement],
       });
@@ -1266,7 +1435,8 @@ async function main() {
         ...resultBase(options),
         status: 'requirements_failed',
         worklist_count: worklist.length,
-        skipped_e2e_count: skipped.length,
+        skipped_e2e_count: skippedE2E,
+        skipped_comment_cutoff_count: skippedCommentCutoff,
         cleared_completed_worker: clearedCompletedWorker,
         cleared_stale_worker: clearedStaleWorker,
         selected,

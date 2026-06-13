@@ -50,6 +50,12 @@ For interactive observation, add `--log-stdout` to mirror audit events to stdout
 node scripts/pr-automation-loop.mjs --project-root "$PROJECT_ROOT" --repo-id mortgage --repo owner/repo --json --log-stdout
 ```
 
+To start processing only new Copilot PR/review comments from now on, persist a local baseline:
+
+```bash
+node scripts/pr-automation-loop.mjs --project-root "$PROJECT_ROOT" --repo-id mortgage --repo owner/repo --set-comment-created-after now --dry-run --json
+```
+
 It wakes on a fixed cadence, such as every 10 minutes. The program owns polling, reconciliation, single-worker locking, prompt rendering, and worker launch. Skills guide behavior after they are loaded; they do not provide the automation runtime.
 
 Each wake-up:
@@ -184,6 +190,7 @@ State lives under the Codex home directory so automation does not dirty the targ
 ```text
 $CODEX_HOME/superpowers/state-index/<repo-id>/
   index.json
+  automation.json
   entities/
     github-owner-repo-pr-123.json
   loops/
@@ -193,6 +200,8 @@ $CODEX_HOME/superpowers/state-index/<repo-id>/
 ```
 
 The state root is machine-local durable state. For `/Users/bhuang/workspace/mortgage`, use a stable repo id such as `mortgage` and write to `/Users/bhuang/.codex/superpowers/state-index/mortgage/`.
+
+`automation.json` stores coordinator policy facts such as `comment_created_after`. It is local machine state, not project source, and is not a persistent queue.
 
 Runtime coordination uses a separate directory:
 
@@ -351,6 +360,12 @@ Priority order:
 2. New actionable Copilot PR conversation comments.
 3. New non-e2e build failures.
 4. Observations that need human escalation.
+
+When `comment_created_after` is set, Copilot PR conversation comments and Copilot inline review comments created at or before that timestamp are skipped. This baseline applies only to comments; non-e2e build failures are still evaluated from the current check state. The cutoff can come from either:
+
+- `--comment-created-after <iso|now>` for a single run
+- `--set-comment-created-after <iso|now>` to persist it to `$CODEX_HOME/superpowers/state-index/<repo-id>/automation.json`
+- `automation.json` on later runs when no CLI cutoff is supplied
 
 The coordinator considers an item already handled when one or more of these facts are true:
 
