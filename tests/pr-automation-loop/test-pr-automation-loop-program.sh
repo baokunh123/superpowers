@@ -24,6 +24,7 @@ OUT="$TMP/out.json"
 CODEX_HOME_DIR="$TMP/codex-home"
 STATE_ROOT="$CODEX_HOME_DIR/superpowers/state-index/mortgage"
 RUNTIME_ROOT="$CODEX_HOME_DIR/superpowers/runtime/mortgage"
+AUDIT_LOG="$RUNTIME_ROOT/audit.jsonl"
 COMMON_ARGS=(--project-root "$TMP" --repo-id mortgage --fixture "$FIXTURE")
 
 cat > "$FIXTURE" <<'JSON'
@@ -82,9 +83,9 @@ JSON
 
 CODEX_HOME="$CODEX_HOME_DIR" node "$SCRIPT" "${COMMON_ARGS[@]}" --dry-run --json > "$OUT"
 
-node - "$OUT" "$TMP" "$STATE_ROOT" "$RUNTIME_ROOT" <<'NODE'
+node - "$OUT" "$TMP" "$STATE_ROOT" "$RUNTIME_ROOT" "$AUDIT_LOG" <<'NODE'
 const fs = require('node:fs');
-const [outPath, projectRoot, stateRoot, runtimeRoot] = process.argv.slice(2);
+const [outPath, projectRoot, stateRoot, runtimeRoot, auditLog] = process.argv.slice(2);
 const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
 
 function assert(condition, message) {
@@ -103,6 +104,20 @@ assert(data.state_root === stateRoot, `expected state_root ${stateRoot}, got ${d
 assert(data.runtime_root === runtimeRoot, `expected runtime_root ${runtimeRoot}, got ${data.runtime_root}`);
 assert(!fs.existsSync(`${projectRoot}/.superpowers/runtime/active-worker.json`), 'dry-run created active-worker.json');
 assert(!fs.existsSync(`${runtimeRoot}/active-worker.json`), 'dry-run created global active-worker.json');
+assert(data.audit_log === auditLog, `expected audit_log ${auditLog}, got ${data.audit_log}`);
+
+assert(fs.existsSync(auditLog), 'audit log was not written');
+const auditEvents = fs.readFileSync(auditLog, 'utf8').trim().split(/\n+/).map(line => JSON.parse(line));
+const eventNames = auditEvents.map(event => event.event);
+for (const eventName of ['wake_started', 'facts_loaded', 'worklist_derived', 'dry_run']) {
+  assert(eventNames.includes(eventName), `expected audit event ${eventName}`);
+}
+const worklistEvent = auditEvents.find(event => event.event === 'worklist_derived');
+assert(worklistEvent.worklist_count === 3, `expected audit worklist count 3, got ${worklistEvent.worklist_count}`);
+assert(worklistEvent.skipped_e2e_count === 1, `expected audit skipped e2e count 1, got ${worklistEvent.skipped_e2e_count}`);
+assert(worklistEvent.selected?.trigger_id === 'github-review-comment-101', `expected audit selected review comment, got ${worklistEvent.selected?.trigger_id}`);
+assert(worklistEvent.repo_id === 'mortgage', `expected audit repo_id mortgage, got ${worklistEvent.repo_id}`);
+assert(!JSON.stringify(worklistEvent).includes('Add a guard for the missing state.'), 'audit log leaked full comment body');
 NODE
 
 mkdir -p "$STATE_ROOT/loops"
@@ -117,9 +132,9 @@ MARKDOWN
 
 CODEX_HOME="$CODEX_HOME_DIR" node "$SCRIPT" "${COMMON_ARGS[@]}" --dry-run --json > "$OUT"
 
-node - "$OUT" <<'NODE'
+node - "$OUT" "$AUDIT_LOG" <<'NODE'
 const fs = require('node:fs');
-const [outPath] = process.argv.slice(2);
+const [outPath, auditLog] = process.argv.slice(2);
 const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
 
 function assert(condition, message) {
@@ -132,6 +147,12 @@ function assert(condition, message) {
 assert(data.status === 'dry_run', `expected dry_run status after handled summary, got ${data.status}`);
 assert(data.worklist_count === 2, `expected handled review comment to be filtered, got ${data.worklist_count}`);
 assert(data.selected?.trigger_id === 'github-pr-comment-202', `expected PR comment after handled review, got ${data.selected?.trigger_id}`);
+
+const auditEvents = fs.readFileSync(auditLog, 'utf8').trim().split(/\n+/).map(line => JSON.parse(line));
+const worklistEvents = auditEvents.filter(event => event.event === 'worklist_derived');
+const latestWorklist = worklistEvents[worklistEvents.length - 1];
+assert(latestWorklist.worklist_count === 2, `expected latest audit worklist count 2, got ${latestWorklist.worklist_count}`);
+assert(latestWorklist.selected?.trigger_id === 'github-pr-comment-202', `expected latest audit selected PR comment, got ${latestWorklist.selected?.trigger_id}`);
 NODE
 
 mkdir -p "$RUNTIME_ROOT"
@@ -159,9 +180,9 @@ JSON
 
 CODEX_HOME="$CODEX_HOME_DIR" node "$SCRIPT" "${COMMON_ARGS[@]}" --dry-run --json > "$OUT"
 
-node - "$OUT" "$TMP" "$RUNTIME_ROOT" <<'NODE'
+node - "$OUT" "$TMP" "$RUNTIME_ROOT" "$AUDIT_LOG" <<'NODE'
 const fs = require('node:fs');
-const [outPath, projectRoot, runtimeRoot] = process.argv.slice(2);
+const [outPath, projectRoot, runtimeRoot, auditLog] = process.argv.slice(2);
 const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
 
 function assert(condition, message) {
@@ -176,6 +197,9 @@ assert(data.cleared_completed_worker === true, 'expected completed lock clearanc
 assert(!fs.existsSync(`${runtimeRoot}/active-worker.json`), 'completed global lock was not cleared');
 assert(!fs.existsSync(`${projectRoot}/.superpowers/runtime/active-worker.json`), 'project-local runtime lock was created');
 assert(data.selected?.trigger_id === 'github-pr-comment-202', `expected remaining PR comment after completed lock, got ${data.selected?.trigger_id}`);
+
+const auditEvents = fs.readFileSync(auditLog, 'utf8').trim().split(/\n+/).map(line => JSON.parse(line));
+assert(auditEvents.some(event => event.event === 'completed_worker_cleared' && event.active_worker?.trigger_id === 'github-review-comment-101'), 'expected completed_worker_cleared audit event');
 NODE
 
 cat > "$RUNTIME_ROOT/active-worker.json" <<'JSON'
@@ -191,13 +215,19 @@ JSON
 
 CODEX_HOME="$CODEX_HOME_DIR" node "$SCRIPT" "${COMMON_ARGS[@]}" --dry-run --json > "$OUT"
 
-node - "$OUT" <<'NODE'
+node - "$OUT" "$AUDIT_LOG" <<'NODE'
 const fs = require('node:fs');
-const [outPath] = process.argv.slice(2);
+const [outPath, auditLog] = process.argv.slice(2);
 const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
 
 if (data.status !== 'worker_active') {
   console.error(`[FAIL] expected worker_active status with existing lock, got ${data.status}`);
+  process.exit(1);
+}
+
+const auditEvents = fs.readFileSync(auditLog, 'utf8').trim().split(/\n+/).map(line => JSON.parse(line));
+if (!auditEvents.some(event => event.event === 'worker_active' && event.active_worker?.trigger_id === 'github-review-comment-999')) {
+  console.error('[FAIL] expected worker_active audit event');
   process.exit(1);
 }
 NODE
@@ -208,9 +238,9 @@ mkdir -p "$EMPTYBIN"
 
 CODEX_HOME="$CODEX_HOME_DIR" PATH="$EMPTYBIN" "$NODE_BIN" "$SCRIPT" "${COMMON_ARGS[@]}" --json > "$OUT"
 
-node - "$OUT" "$TMP" "$RUNTIME_ROOT" <<'NODE'
+node - "$OUT" "$TMP" "$RUNTIME_ROOT" "$AUDIT_LOG" <<'NODE'
 const fs = require('node:fs');
-const [outPath, projectRoot, runtimeRoot] = process.argv.slice(2);
+const [outPath, projectRoot, runtimeRoot, auditLog] = process.argv.slice(2);
 const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
 
 function assert(condition, message) {
@@ -226,6 +256,12 @@ assert(Array.isArray(data.missing_requirements), 'expected missing_requirements 
 assert(data.missing_requirements.some(requirement => requirement.id === 'codex'), 'expected missing codex requirement');
 assert(!fs.existsSync(`${projectRoot}/.superpowers/runtime/active-worker.json`), 'requirements failure created active-worker.json');
 assert(!fs.existsSync(`${runtimeRoot}/active-worker.json`), 'requirements failure created global active-worker.json');
+
+const auditEvents = fs.readFileSync(auditLog, 'utf8').trim().split(/\n+/).map(line => JSON.parse(line));
+const requirementEvents = auditEvents.filter(event => event.event === 'requirements_failed');
+const latestRequirementEvent = requirementEvents[requirementEvents.length - 1];
+assert(latestRequirementEvent.selected?.trigger_id === 'github-pr-comment-202', `expected audit selected trigger for failed requirements, got ${latestRequirementEvent.selected?.trigger_id}`);
+assert(latestRequirementEvent.missing_requirements.some(requirement => requirement.id === 'codex'), 'expected audit missing codex requirement');
 NODE
 
 FAKEBIN="$TMP/fakebin"
@@ -263,10 +299,10 @@ chmod +x "$FAKEBIN/codex"
 
 CODEX_HOME="$CODEX_HOME_DIR" PATH="$FAKEBIN:$PATH" node "$SCRIPT" "${COMMON_ARGS[@]}" --json > "$OUT"
 
-node - "$OUT" "$TMP" "$RUNTIME_ROOT" "$STATE_ROOT" <<'NODE'
+node - "$OUT" "$TMP" "$RUNTIME_ROOT" "$STATE_ROOT" "$AUDIT_LOG" <<'NODE'
 const fs = require('node:fs');
 const path = require('node:path');
-const [outPath, projectRoot, runtimeRoot, stateRoot] = process.argv.slice(2);
+const [outPath, projectRoot, runtimeRoot, stateRoot, auditLog] = process.argv.slice(2);
 const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
 
 function assert(condition, message) {
@@ -293,6 +329,14 @@ const prompt = fs.readFileSync(path.join(lock.run_dir, 'worker-prompt.md'), 'utf
 assert(prompt.includes('Process exactly one trigger'), 'worker prompt was not rendered from template');
 assert(prompt.includes('github-pr-comment-202'), 'worker prompt missing selected trigger');
 assert(prompt.includes(stateRoot), 'worker prompt missing global state root');
+
+const auditEvents = fs.readFileSync(auditLog, 'utf8').trim().split(/\n+/).map(line => JSON.parse(line));
+assert(auditEvents.some(event => event.event === 'worker_launching' && event.selected?.trigger_id === 'github-pr-comment-202'), 'expected worker_launching audit event');
+const launchedEvents = auditEvents.filter(event => event.event === 'worker_launched');
+const latestLaunchedEvent = launchedEvents[launchedEvents.length - 1];
+assert(latestLaunchedEvent.selected?.trigger_id === 'github-pr-comment-202', `expected worker_launched trigger github-pr-comment-202, got ${latestLaunchedEvent.selected?.trigger_id}`);
+assert(Number.isInteger(latestLaunchedEvent.worker_pid), 'expected worker_pid in worker_launched audit event');
+assert(latestLaunchedEvent.run_dir === lock.run_dir, `expected audit run_dir ${lock.run_dir}, got ${latestLaunchedEvent.run_dir}`);
 NODE
 
 pass "pr-automation-loop program derives work, reconciles state, and respects active worker lock"

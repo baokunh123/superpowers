@@ -192,14 +192,16 @@ Runtime coordination uses a separate directory:
 ```text
 $CODEX_HOME/superpowers/runtime/<repo-id>/
   active-worker.json
+  audit.jsonl
   runs/
     2026-06-12T10-20-00-pr-123-comment-98765/
       worker-prompt.md
       final.md
       stdout.jsonl
+      stderr.log
 ```
 
-Runtime files are operational locks and logs, not durable loop state.
+Runtime files are operational locks and logs, not durable loop state. `audit.jsonl` is the append-only coordinator audit stream for what woke the script, what it derived, whether it launched a worker, and what result evidence it reconciled later.
 
 ### State Handle
 
@@ -287,6 +289,24 @@ Example:
 ```
 
 If the lock exists, the coordinator does not start another worker. If the lock appears stale, the coordinator checks external state and local process/run evidence before clearing it.
+
+## Audit Log
+
+The coordinator writes append-only JSON Lines to:
+
+```text
+$CODEX_HOME/superpowers/runtime/<repo-id>/audit.jsonl
+```
+
+Each event includes:
+
+- `timestamp`, `event`, `repo_id`, `project_root`, `state_root`, and `runtime_root`
+- selected trigger metadata: trigger ID, PR, repo, URL, check name, and Buildkite details URL when present
+- counts for loaded PRs, derived work items, handled triggers, and skipped e2e failures
+- requirement failures before discovery or worker launch
+- active-worker, lock-race, launch, launch-failure, stale-lock-clear, and completed-worker-clear events
+
+The audit log intentionally records trigger identity and run artifacts, not full Copilot comment bodies or full worker output. Worker stdout, stderr, prompt, and final summary stay in the per-run directory referenced by the audit event. Durable facts still live under `state-index` and are written by `loop-state`.
 
 ## Derived Worklist
 

@@ -528,7 +528,88 @@ function runtimePaths(options) {
   const runtimeDir = options.runtimeRoot;
   const lockPath = path.join(runtimeDir, 'active-worker.json');
   const runsDir = path.join(runtimeDir, 'runs');
-  return { runtimeDir, lockPath, runsDir };
+  const auditPath = path.join(runtimeDir, 'audit.jsonl');
+  return { runtimeDir, lockPath, runsDir, auditPath };
+}
+
+function resultBase(options) {
+  const { auditPath } = runtimePaths(options);
+  return {
+    state_root: options.stateRoot,
+    runtime_root: options.runtimeRoot,
+    audit_log: auditPath,
+  };
+}
+
+function summarizeWorkItem(item) {
+  if (!item) return null;
+  return {
+    type: item.type,
+    priority: item.priority,
+    trigger_id: item.trigger_id,
+    repo: item.repo,
+    pr_number: item.pr_number,
+    pr_url: item.pr_url,
+    head_sha: item.head_sha,
+    branch: item.branch,
+    base: item.base,
+    worktree_path: item.worktree_path,
+    external_id: item.external_id,
+    path: item.path,
+    line: item.line,
+    url: item.url,
+    name: item.name,
+    conclusion: item.conclusion,
+    details_url: item.details_url,
+  };
+}
+
+function summarizeSkippedItem(item) {
+  return {
+    repo: item.repo,
+    pr_number: item.pr_number,
+    reason: item.reason,
+    name: item.name,
+  };
+}
+
+function summarizeActiveWorker(activeWorker) {
+  if (!activeWorker) return null;
+  return {
+    version: activeWorker.version,
+    status: activeWorker.status,
+    started_at: activeWorker.started_at,
+    worker_started_at: activeWorker.worker_started_at,
+    repo: activeWorker.repo,
+    pr_number: activeWorker.pr_number,
+    trigger_id: activeWorker.trigger_id,
+    worker_pid: activeWorker.worker_pid,
+    worktree_path: activeWorker.worktree_path,
+    run_dir: activeWorker.run_dir,
+  };
+}
+
+function errorSummary(error) {
+  return {
+    name: error.name || 'Error',
+    message: error.message || String(error),
+  };
+}
+
+async function appendAudit(options, event, fields = {}) {
+  const { runtimeDir, auditPath } = runtimePaths(options);
+  await mkdir(runtimeDir, { recursive: true });
+  const entry = {
+    version: 1,
+    timestamp: new Date().toISOString(),
+    event,
+    repo_id: options.repoId,
+    project_root: options.projectRoot,
+    state_root: options.stateRoot,
+    runtime_root: options.runtimeRoot,
+    ...fields,
+  };
+  await writeFile(auditPath, `${JSON.stringify(entry)}\n`, { flag: 'a' });
 }
 
 async function readActiveWorker(lockPath) {
@@ -555,36 +636,61 @@ function resolveRunDir(options, activeWorker) {
   return path.join(options.runtimeRoot, activeWorker.run_dir);
 }
 
-async function hasCompletionEvidence(options, activeWorker) {
-  const runDir = resolveRunDir(options, activeWorker);
-  if (!runDir) return false;
+function matchSummaryLine(text, label) {
+  return text.match(new RegExp(`^${label}:\\s*(.+)$`, 'im'))?.[1]?.trim() || null;
+}
 
-  const finalText = await readTextIfExists(path.join(runDir, 'final.md'));
-  if (!finalText) return false;
+function parseCompletionEvidence(finalText) {
+  const outcome = matchSummaryLine(finalText, 'Outcome');
+  if (!outcome || !completedOutcome(outcome)) return null;
 
-  const outcome = finalText.match(/^Outcome:\s*(\S+)/im)?.[1];
-  if (!outcome || !completedOutcome(outcome)) return false;
-
-  const state = finalText.match(/^State:\s*(.+)$/im)?.[1]?.trim();
-  const reply = finalText.match(/^Reply:\s*(.+)$/im)?.[1]?.trim();
+  const state = matchSummaryLine(finalText, 'State');
+  const reply = matchSummaryLine(finalText, 'Reply');
+  const markerTriggers = [...parseMarkerTriggers(finalText)];
   const hasState = state && normalizeName(state) !== 'none';
   const hasReply = reply && normalizeName(reply) !== 'none';
 
-  return Boolean(hasState || hasReply || parseMarkerTriggers(finalText).size > 0);
+  if (!hasState && !hasReply && markerTriggers.length === 0) return null;
+
+  return {
+    outcome,
+    trigger: matchSummaryLine(finalText, 'Trigger'),
+    commit: matchSummaryLine(finalText, 'Commit'),
+    validation: matchSummaryLine(finalText, 'Validation'),
+    state: hasState ? state : null,
+    reply: hasReply ? reply : null,
+    marker_triggers: markerTriggers,
+  };
+}
+
+async function readCompletionEvidence(options, activeWorker) {
+  const runDir = resolveRunDir(options, activeWorker);
+  if (!runDir) return null;
+
+  const finalText = await readTextIfExists(path.join(runDir, 'final.md'));
+  if (!finalText) return null;
+
+  return parseCompletionEvidence(finalText);
 }
 
 async function reconcileActiveWorker(options, lockPath) {
   const activeWorker = await readActiveWorker(lockPath);
   if (!activeWorker) {
-    return { activeWorker: null, clearedCompletedWorker: false };
+    return { activeWorker: null, clearedCompletedWorker: false, clearedCompletedWorkerRecord: null, completion: null };
   }
 
-  if (await hasCompletionEvidence(options, activeWorker)) {
+  const completion = await readCompletionEvidence(options, activeWorker);
+  if (completion) {
     await rm(lockPath, { force: true });
-    return { activeWorker: null, clearedCompletedWorker: true };
+    return {
+      activeWorker: null,
+      clearedCompletedWorker: true,
+      clearedCompletedWorkerRecord: activeWorker,
+      completion,
+    };
   }
 
-  return { activeWorker, clearedCompletedWorker: false };
+  return { activeWorker, clearedCompletedWorker: false, clearedCompletedWorkerRecord: null, completion: null };
 }
 
 function isRecordedWorkerRunning(activeWorker) {
@@ -607,10 +713,10 @@ async function maybeClearStaleHandledLock(projectRoot, lockPath, activeWorker, h
 
   if (running === false && handledTriggers.has(activeWorker.trigger_id)) {
     await rm(lockPath, { force: true });
-    return { activeWorker: null, clearedStaleWorker: true };
+    return { activeWorker: null, clearedStaleWorker: true, clearedStaleWorkerRecord: activeWorker };
   }
 
-  return { activeWorker, clearedStaleWorker: false };
+  return { activeWorker, clearedStaleWorker: false, clearedStaleWorkerRecord: null };
 }
 
 function timestampForPath(date = new Date()) {
@@ -676,7 +782,7 @@ async function updateLock(lockPath, lock) {
 
 async function launchWorker(options, selected) {
   const projectRoot = options.projectRoot;
-  const { runtimeDir, lockPath, runsDir } = runtimePaths(options);
+  const { runtimeDir, lockPath, runsDir, auditPath } = runtimePaths(options);
   await mkdir(runsDir, { recursive: true });
   await mkdir(runtimeDir, { recursive: true });
 
@@ -753,7 +859,11 @@ async function launchWorker(options, selected) {
       lock_path: lockPath,
       state_root: options.stateRoot,
       runtime_root: options.runtimeRoot,
+      audit_log: auditPath,
       run_dir: runDir,
+      final_path: finalPath,
+      stdout_path: stdoutPath,
+      stderr_path: stderrPath,
       worker_pid: child.pid,
     };
   } catch (error) {
@@ -786,9 +896,22 @@ async function main() {
   options.stateRoot = roots.stateRoot;
   options.runtimeRoot = roots.runtimeRoot;
 
+  await appendAudit(options, 'wake_started', {
+    dry_run: options.dryRun,
+    include_drafts: options.includeDrafts,
+    discovery: options.fixture
+      ? { mode: 'fixture', fixture: path.resolve(options.fixture) }
+      : { mode: 'github', repo: options.repo || null },
+  });
+
   const missingDiscoveryRequirements = await checkDiscoveryRequirements(options);
   if (missingDiscoveryRequirements.length > 0) {
+    await appendAudit(options, 'requirements_failed', {
+      phase: 'discovery',
+      missing_requirements: missingDiscoveryRequirements,
+    });
     output({
+      ...resultBase(options),
       status: 'requirements_failed',
       missing_requirements: missingDiscoveryRequirements,
     }, options);
@@ -796,22 +919,49 @@ async function main() {
   }
 
   const { lockPath } = runtimePaths(options);
-  const { activeWorker, clearedCompletedWorker } = await reconcileActiveWorker(options, lockPath);
+  const {
+    activeWorker,
+    clearedCompletedWorker,
+    clearedCompletedWorkerRecord,
+    completion,
+  } = await reconcileActiveWorker(options, lockPath);
+  if (clearedCompletedWorker) {
+    await appendAudit(options, 'completed_worker_cleared', {
+      active_worker: summarizeActiveWorker(clearedCompletedWorkerRecord),
+      completion,
+    });
+  }
+
   const facts = await loadFacts(options);
+  await appendAudit(options, 'facts_loaded', {
+    pull_request_count: (facts.pull_requests || facts.prs || []).length,
+  });
+
   const handledTriggers = await collectHandledTriggers(options.stateRoot, facts);
   let clearedStaleWorker = false;
+  let clearedStaleWorkerRecord = null;
 
   if (activeWorker) {
     const staleResult = await maybeClearStaleHandledLock(options.projectRoot, lockPath, activeWorker, handledTriggers);
     clearedStaleWorker = staleResult.clearedStaleWorker;
+    clearedStaleWorkerRecord = staleResult.clearedStaleWorkerRecord;
+    if (clearedStaleWorker) {
+      await appendAudit(options, 'stale_worker_cleared', {
+        active_worker: summarizeActiveWorker(clearedStaleWorkerRecord),
+        handled_trigger_count: handledTriggers.size,
+      });
+    }
 
     if (staleResult.activeWorker) {
+      await appendAudit(options, 'worker_active', {
+        reason: 'active_lock',
+        active_worker: summarizeActiveWorker(staleResult.activeWorker),
+      });
       output({
+        ...resultBase(options),
         status: 'worker_active',
         active_worker: staleResult.activeWorker,
         lock_path: lockPath,
-        state_root: options.stateRoot,
-        runtime_root: options.runtimeRoot,
       }, options);
       return;
     }
@@ -819,14 +969,27 @@ async function main() {
 
   const { worklist, skipped } = deriveWorklist(facts, { ...options, handledTriggers });
   const selected = worklist[0] || null;
+  await appendAudit(options, 'worklist_derived', {
+    handled_trigger_count: handledTriggers.size,
+    worklist_count: worklist.length,
+    skipped_e2e_count: skipped.length,
+    selected: summarizeWorkItem(selected),
+    worklist: worklist.map(summarizeWorkItem),
+    skipped: skipped.map(summarizeSkippedItem),
+  });
 
   if (!selected) {
+    await appendAudit(options, 'no_work', {
+      worklist_count: 0,
+      skipped_e2e_count: skipped.length,
+      cleared_completed_worker: clearedCompletedWorker,
+      cleared_stale_worker: clearedStaleWorker,
+    });
     output({
+      ...resultBase(options),
       status: 'no_work',
       worklist_count: 0,
       skipped_e2e_count: skipped.length,
-      state_root: options.stateRoot,
-      runtime_root: options.runtimeRoot,
       cleared_completed_worker: clearedCompletedWorker,
       cleared_stale_worker: clearedStaleWorker,
     }, options);
@@ -834,12 +997,18 @@ async function main() {
   }
 
   if (options.dryRun) {
+    await appendAudit(options, 'dry_run', {
+      worklist_count: worklist.length,
+      skipped_e2e_count: skipped.length,
+      selected: summarizeWorkItem(selected),
+      cleared_completed_worker: clearedCompletedWorker,
+      cleared_stale_worker: clearedStaleWorker,
+    });
     output({
+      ...resultBase(options),
       status: 'dry_run',
       worklist_count: worklist.length,
       skipped_e2e_count: skipped.length,
-      state_root: options.stateRoot,
-      runtime_root: options.runtimeRoot,
       cleared_completed_worker: clearedCompletedWorker,
       cleared_stale_worker: clearedStaleWorker,
       selected,
@@ -851,12 +1020,20 @@ async function main() {
 
   const missingWorkerRequirements = await checkWorkerRequirements(options, selected);
   if (missingWorkerRequirements.length > 0) {
+    await appendAudit(options, 'requirements_failed', {
+      phase: 'worker',
+      worklist_count: worklist.length,
+      skipped_e2e_count: skipped.length,
+      selected: summarizeWorkItem(selected),
+      missing_requirements: missingWorkerRequirements,
+      cleared_completed_worker: clearedCompletedWorker,
+      cleared_stale_worker: clearedStaleWorker,
+    });
     output({
+      ...resultBase(options),
       status: 'requirements_failed',
       worklist_count: worklist.length,
       skipped_e2e_count: skipped.length,
-      state_root: options.stateRoot,
-      runtime_root: options.runtimeRoot,
       cleared_completed_worker: clearedCompletedWorker,
       cleared_stale_worker: clearedStaleWorker,
       selected,
@@ -866,18 +1043,41 @@ async function main() {
   }
 
   try {
-    output(await launchWorker(options, selected), options);
+    await appendAudit(options, 'worker_launching', {
+      worklist_count: worklist.length,
+      skipped_e2e_count: skipped.length,
+      selected: summarizeWorkItem(selected),
+    });
+    const launchResult = await launchWorker(options, selected);
+    await appendAudit(options, 'worker_launched', {
+      selected: summarizeWorkItem(selected),
+      lock_path: launchResult.lock_path,
+      run_dir: launchResult.run_dir,
+      final_path: launchResult.final_path,
+      stdout_path: launchResult.stdout_path,
+      stderr_path: launchResult.stderr_path,
+      worker_pid: launchResult.worker_pid,
+    });
+    output(launchResult, options);
   } catch (error) {
     if (error instanceof ActiveWorkerLockExists) {
+      const activeWorkerAfterRace = await readActiveWorker(lockPath);
+      await appendAudit(options, 'worker_active', {
+        reason: 'lock_race',
+        active_worker: summarizeActiveWorker(activeWorkerAfterRace),
+      });
       output({
+        ...resultBase(options),
         status: 'worker_active',
-        active_worker: await readActiveWorker(lockPath),
+        active_worker: activeWorkerAfterRace,
         lock_path: lockPath,
-        state_root: options.stateRoot,
-        runtime_root: options.runtimeRoot,
       }, options);
       return;
     }
+    await appendAudit(options, 'worker_launch_failed', {
+      selected: summarizeWorkItem(selected),
+      error: errorSummary(error),
+    });
     throw error;
   }
 }

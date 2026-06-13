@@ -57,7 +57,14 @@
 - [x] If requirements are missing, return `requirements_failed` with `missing_requirements`.
 - [x] Do not write `active-worker.json` when requirements fail.
 
-### Task 6: Verification
+### Task 6: Auditability
+
+- [x] Write append-only coordinator events to `$CODEX_HOME/superpowers/runtime/<repo-id>/audit.jsonl`.
+- [x] Record wake, facts-loaded, worklist-derived, no-work, dry-run, active-worker, requirement-failure, launch, launch-failure, stale-lock-clear, and completed-worker-clear events.
+- [x] Include trigger identity, PR/check metadata, counts, run artifact paths, and worker completion evidence.
+- [x] Do not write full Copilot comment bodies into the audit log.
+
+### Task 7: Verification
 
 - [x] `node --check scripts/pr-automation-loop.mjs`
 - [x] `tests/pr-automation-loop/test-pr-automation-loop-program.sh`
