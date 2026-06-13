@@ -44,6 +44,12 @@ The coordinator is a scheduled program invoked by Codex Automations, for example
 node scripts/pr-automation-loop.mjs --project-root "$PROJECT_ROOT" --repo-id mortgage --repo owner/repo
 ```
 
+For interactive observation, add `--log-stdout` to mirror audit events to stdout while the script runs:
+
+```bash
+node scripts/pr-automation-loop.mjs --project-root "$PROJECT_ROOT" --repo-id mortgage --repo owner/repo --json --log-stdout
+```
+
 It wakes on a fixed cadence, such as every 10 minutes. The program owns polling, reconciliation, single-worker locking, prompt rendering, and worker launch. Skills guide behavior after they are loaded; they do not provide the automation runtime.
 
 Each wake-up:
@@ -307,6 +313,8 @@ Each event includes:
 - active-worker, lock-race, launch, launch-failure, stale-lock-clear, and completed-worker-clear events
 
 The audit log intentionally records trigger identity and run artifacts, not full Copilot comment bodies or full worker output. Worker stdout, stderr, prompt, and final summary stay in the per-run directory referenced by the audit event. Durable facts still live under `state-index` and are written by `loop-state`.
+
+By default, stdout is reserved for the final script result. With `--log-stdout`, each audit event is also written to stdout as one JSON line; when combined with `--json`, the final result is also a single JSON line after the audit events.
 
 ## Derived Worklist
 

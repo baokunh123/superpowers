@@ -63,6 +63,7 @@
 - [x] Record wake, facts-loaded, worklist-derived, no-work, dry-run, active-worker, requirement-failure, launch, launch-failure, stale-lock-clear, and completed-worker-clear events.
 - [x] Include trigger identity, PR/check metadata, counts, run artifact paths, and worker completion evidence.
 - [x] Do not write full Copilot comment bodies into the audit log.
+- [x] Support `--log-stdout` for mirroring audit events to stdout during interactive runs.
 
 ### Task 7: Verification
 

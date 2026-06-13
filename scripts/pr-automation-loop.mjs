@@ -32,6 +32,7 @@ Options:
   --include-drafts        Allow draft PRs to produce work items.
   --dry-run               Derive work without creating a lock or launching Codex.
   --json                  Emit JSON output.
+  --log-stdout            Mirror audit events to stdout as JSONL.
   --help                  Show this help.
 `;
 }
@@ -47,6 +48,7 @@ function parseArgs(argv) {
     includeDrafts: false,
     dryRun: false,
     json: false,
+    logStdout: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -78,6 +80,9 @@ function parseArgs(argv) {
         break;
       case '--json':
         options.json = true;
+        break;
+      case '--log-stdout':
+        options.logStdout = true;
         break;
       case '--help':
         options.help = true;
@@ -610,6 +615,9 @@ async function appendAudit(options, event, fields = {}) {
     ...fields,
   };
   await writeFile(auditPath, `${JSON.stringify(entry)}\n`, { flag: 'a' });
+  if (options.logStdout) {
+    process.stdout.write(`${JSON.stringify(entry)}\n`);
+  }
 }
 
 async function readActiveWorker(lockPath) {
@@ -874,7 +882,10 @@ async function launchWorker(options, selected) {
 
 function output(result, options) {
   if (options.json) {
-    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    const json = options.logStdout
+      ? JSON.stringify(result)
+      : JSON.stringify(result, null, 2);
+    process.stdout.write(`${json}\n`);
   } else {
     process.stdout.write(`${result.status}\n`);
     if (result.selected) {

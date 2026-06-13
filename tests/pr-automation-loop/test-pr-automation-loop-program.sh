@@ -21,6 +21,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 FIXTURE="$TMP/facts.json"
 OUT="$TMP/out.json"
+LOG_STDOUT_OUT="$TMP/log-stdout.jsonl"
 CODEX_HOME_DIR="$TMP/codex-home"
 STATE_ROOT="$CODEX_HOME_DIR/superpowers/state-index/mortgage"
 RUNTIME_ROOT="$CODEX_HOME_DIR/superpowers/runtime/mortgage"
@@ -118,6 +119,33 @@ assert(worklistEvent.skipped_e2e_count === 1, `expected audit skipped e2e count 
 assert(worklistEvent.selected?.trigger_id === 'github-review-comment-101', `expected audit selected review comment, got ${worklistEvent.selected?.trigger_id}`);
 assert(worklistEvent.repo_id === 'mortgage', `expected audit repo_id mortgage, got ${worklistEvent.repo_id}`);
 assert(!JSON.stringify(worklistEvent).includes('Add a guard for the missing state.'), 'audit log leaked full comment body');
+NODE
+
+rm -f "$AUDIT_LOG"
+CODEX_HOME="$CODEX_HOME_DIR" node "$SCRIPT" "${COMMON_ARGS[@]}" --dry-run --json --log-stdout > "$LOG_STDOUT_OUT"
+
+node - "$LOG_STDOUT_OUT" "$AUDIT_LOG" <<'NODE'
+const fs = require('node:fs');
+const [stdoutPath, auditLog] = process.argv.slice(2);
+
+function assert(condition, message) {
+  if (!condition) {
+    console.error(`[FAIL] ${message}`);
+    process.exit(1);
+  }
+}
+
+const stdoutLines = fs.readFileSync(stdoutPath, 'utf8').trim().split(/\n+/).map(line => JSON.parse(line));
+const auditLines = fs.readFileSync(auditLog, 'utf8').trim().split(/\n+/).map(line => JSON.parse(line));
+const stdoutEvents = stdoutLines.filter(line => line.event);
+const finalResult = stdoutLines[stdoutLines.length - 1];
+
+assert(stdoutEvents.length === auditLines.length, `expected ${auditLines.length} stdout audit events, got ${stdoutEvents.length}`);
+assert(stdoutEvents.some(event => event.event === 'wake_started'), 'expected wake_started on stdout');
+assert(stdoutEvents.some(event => event.event === 'worklist_derived'), 'expected worklist_derived on stdout');
+assert(stdoutEvents.some(event => event.event === 'dry_run'), 'expected dry_run audit event on stdout');
+assert(finalResult.status === 'dry_run', `expected final stdout result dry_run, got ${finalResult.status}`);
+assert(finalResult.selected?.trigger_id === 'github-review-comment-101', `expected final stdout selected trigger, got ${finalResult.selected?.trigger_id}`);
 NODE
 
 mkdir -p "$STATE_ROOT/loops"
