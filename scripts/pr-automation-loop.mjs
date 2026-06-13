@@ -12,6 +12,7 @@ import {
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { homedir } from 'node:os';
 
 const COPILOT_LOGIN = 'github-copilot[bot]';
 const E2E_NAME = 'e2e tests';
@@ -25,6 +26,9 @@ Options:
   --project-root <path>   Target project root. Defaults to cwd.
   --fixture <path>        Read PR facts from JSON fixture instead of gh.
   --repo <owner/repo>     Limit live gh discovery to a repository.
+  --repo-id <id>          Stable local state id. Defaults to project root name.
+  --state-root <path>     Override durable loop-state root.
+  --runtime-root <path>   Override automation runtime root.
   --include-drafts        Allow draft PRs to produce work items.
   --dry-run               Derive work without creating a lock or launching Codex.
   --json                  Emit JSON output.
@@ -37,6 +41,9 @@ function parseArgs(argv) {
     projectRoot: process.cwd(),
     fixture: null,
     repo: null,
+    repoId: null,
+    stateRoot: null,
+    runtimeRoot: null,
     includeDrafts: false,
     dryRun: false,
     json: false,
@@ -53,6 +60,15 @@ function parseArgs(argv) {
         break;
       case '--repo':
         options.repo = argv[++index];
+        break;
+      case '--repo-id':
+        options.repoId = argv[++index];
+        break;
+      case '--state-root':
+        options.stateRoot = argv[++index];
+        break;
+      case '--runtime-root':
+        options.runtimeRoot = argv[++index];
         break;
       case '--include-drafts':
         options.includeDrafts = true;
@@ -76,6 +92,32 @@ function parseArgs(argv) {
 
 function normalizeName(value) {
   return String(value || '').trim().toLowerCase();
+}
+
+function normalizeId(value) {
+  return normalizeName(value)
+    .replaceAll(/[^a-z0-9._-]+/g, '-')
+    .replaceAll(/^-+|-+$/g, '') || 'default';
+}
+
+function codexHome() {
+  return process.env.CODEX_HOME
+    ? path.resolve(process.env.CODEX_HOME)
+    : path.join(homedir(), '.codex');
+}
+
+function resolveStateRoots(options) {
+  const repoId = normalizeId(options.repoId || path.basename(options.projectRoot));
+  const superpowersRoot = path.join(codexHome(), 'superpowers');
+  return {
+    repoId,
+    stateRoot: options.stateRoot
+      ? path.resolve(options.stateRoot)
+      : path.join(superpowersRoot, 'state-index', repoId),
+    runtimeRoot: options.runtimeRoot
+      ? path.resolve(options.runtimeRoot)
+      : path.join(superpowersRoot, 'runtime', repoId),
+  };
 }
 
 function isE2EName(value) {
@@ -218,9 +260,9 @@ function deriveWorklist(facts, options = {}) {
   return { worklist, skipped };
 }
 
-async function collectLoopStateHandledTriggers(projectRoot) {
+async function collectLoopStateHandledTriggers(stateRoot) {
   const handled = new Set();
-  const loopsDir = path.join(projectRoot, '.superpowers', 'state', 'loops');
+  const loopsDir = path.join(stateRoot, 'loops');
   let entries;
 
   try {
@@ -262,9 +304,9 @@ function collectGitHubMarkerHandledTriggers(facts) {
   return handled;
 }
 
-async function collectHandledTriggers(projectRoot, facts) {
+async function collectHandledTriggers(stateRoot, facts) {
   return new Set([
-    ...(await collectLoopStateHandledTriggers(projectRoot)),
+    ...(await collectLoopStateHandledTriggers(stateRoot)),
     ...collectGitHubMarkerHandledTriggers(facts),
   ]);
 }
@@ -482,8 +524,8 @@ async function loadFacts(options) {
   return loadLiveFacts(options);
 }
 
-function runtimePaths(projectRoot) {
-  const runtimeDir = path.join(projectRoot, '.superpowers', 'runtime');
+function runtimePaths(options) {
+  const runtimeDir = options.runtimeRoot;
   const lockPath = path.join(runtimeDir, 'active-worker.json');
   const runsDir = path.join(runtimeDir, 'runs');
   return { runtimeDir, lockPath, runsDir };
@@ -507,14 +549,14 @@ async function readTextIfExists(file) {
   }
 }
 
-function resolveRunDir(projectRoot, activeWorker) {
+function resolveRunDir(options, activeWorker) {
   if (!activeWorker?.run_dir) return null;
   if (path.isAbsolute(activeWorker.run_dir)) return activeWorker.run_dir;
-  return path.join(projectRoot, activeWorker.run_dir);
+  return path.join(options.runtimeRoot, activeWorker.run_dir);
 }
 
-async function hasCompletionEvidence(projectRoot, activeWorker) {
-  const runDir = resolveRunDir(projectRoot, activeWorker);
+async function hasCompletionEvidence(options, activeWorker) {
+  const runDir = resolveRunDir(options, activeWorker);
   if (!runDir) return false;
 
   const finalText = await readTextIfExists(path.join(runDir, 'final.md'));
@@ -531,13 +573,13 @@ async function hasCompletionEvidence(projectRoot, activeWorker) {
   return Boolean(hasState || hasReply || parseMarkerTriggers(finalText).size > 0);
 }
 
-async function reconcileActiveWorker(projectRoot, lockPath) {
+async function reconcileActiveWorker(options, lockPath) {
   const activeWorker = await readActiveWorker(lockPath);
   if (!activeWorker) {
     return { activeWorker: null, clearedCompletedWorker: false };
   }
 
-  if (await hasCompletionEvidence(projectRoot, activeWorker)) {
+  if (await hasCompletionEvidence(options, activeWorker)) {
     await rm(lockPath, { force: true });
     return { activeWorker: null, clearedCompletedWorker: true };
   }
@@ -582,17 +624,20 @@ function renderTemplate(template, values) {
   });
 }
 
-async function writeWorkerPrompt(projectRoot, runDir, selected) {
+async function writeWorkerPrompt(options, runDir, selected) {
   const template = await readFile(WORKER_TEMPLATE_PATH, 'utf8');
   const promptPath = path.join(runDir, 'worker-prompt.md');
   const entityId = `github:${selected.repo}:pull/${selected.pr_number}`;
-  const entityFile = `.superpowers/state/entities/${selected.repo.replaceAll(/[/:]/g, '-')}-pr-${selected.pr_number}.json`;
+  const entityFile = path.join(options.stateRoot, 'entities', `${selected.repo.replaceAll(/[/:]/g, '-')}-pr-${selected.pr_number}.json`);
   const worktreeId = `wt-pr-${selected.pr_number}`;
-  const worktreePath = selected.worktree_path || projectRoot;
+  const worktreePath = selected.worktree_path || options.projectRoot;
 
   const prompt = renderTemplate(template, {
     repo: selected.repo,
     pr_number: selected.pr_number,
+    repo_id: options.repoId,
+    state_root: options.stateRoot,
+    runtime_root: options.runtimeRoot,
     entity_id: entityId,
     entity_file: entityFile,
     worktree_id: worktreeId,
@@ -631,12 +676,11 @@ async function updateLock(lockPath, lock) {
 
 async function launchWorker(options, selected) {
   const projectRoot = options.projectRoot;
-  const { runtimeDir, lockPath, runsDir } = runtimePaths(projectRoot);
+  const { runtimeDir, lockPath, runsDir } = runtimePaths(options);
   await mkdir(runsDir, { recursive: true });
   await mkdir(runtimeDir, { recursive: true });
 
-  const runDirRel = path.join('.superpowers', 'runtime', 'runs', `${timestampForPath()}-${selected.pr_number}-${selected.trigger_id}`);
-  const runDir = path.join(projectRoot, runDirRel);
+  const runDir = path.join(runsDir, `${timestampForPath()}-${selected.pr_number}-${selected.trigger_id}`);
   await mkdir(runDir, { recursive: true });
 
   const lock = {
@@ -647,7 +691,7 @@ async function launchWorker(options, selected) {
     pr_number: selected.pr_number,
     trigger_id: selected.trigger_id,
     worktree_path: selected.worktree_path || projectRoot,
-    run_dir: runDirRel,
+    run_dir: runDir,
   };
 
   try {
@@ -660,7 +704,7 @@ async function launchWorker(options, selected) {
   }
 
   try {
-    const { promptPath, worktreePath } = await writeWorkerPrompt(projectRoot, runDir, selected);
+    const { promptPath, worktreePath } = await writeWorkerPrompt(options, runDir, selected);
     const finalPath = path.join(runDir, 'final.md');
     const stdoutPath = path.join(runDir, 'stdout.jsonl');
     const stderrPath = path.join(runDir, 'stderr.log');
@@ -707,7 +751,9 @@ async function launchWorker(options, selected) {
       status: 'launched',
       selected,
       lock_path: lockPath,
-      run_dir: runDirRel,
+      state_root: options.stateRoot,
+      runtime_root: options.runtimeRoot,
+      run_dir: runDir,
       worker_pid: child.pid,
     };
   } catch (error) {
@@ -735,6 +781,11 @@ async function main() {
   }
 
   options.projectRoot = path.resolve(options.projectRoot);
+  const roots = resolveStateRoots(options);
+  options.repoId = roots.repoId;
+  options.stateRoot = roots.stateRoot;
+  options.runtimeRoot = roots.runtimeRoot;
+
   const missingDiscoveryRequirements = await checkDiscoveryRequirements(options);
   if (missingDiscoveryRequirements.length > 0) {
     output({
@@ -744,10 +795,10 @@ async function main() {
     return;
   }
 
-  const { lockPath } = runtimePaths(options.projectRoot);
-  const { activeWorker, clearedCompletedWorker } = await reconcileActiveWorker(options.projectRoot, lockPath);
+  const { lockPath } = runtimePaths(options);
+  const { activeWorker, clearedCompletedWorker } = await reconcileActiveWorker(options, lockPath);
   const facts = await loadFacts(options);
-  const handledTriggers = await collectHandledTriggers(options.projectRoot, facts);
+  const handledTriggers = await collectHandledTriggers(options.stateRoot, facts);
   let clearedStaleWorker = false;
 
   if (activeWorker) {
@@ -759,6 +810,8 @@ async function main() {
         status: 'worker_active',
         active_worker: staleResult.activeWorker,
         lock_path: lockPath,
+        state_root: options.stateRoot,
+        runtime_root: options.runtimeRoot,
       }, options);
       return;
     }
@@ -772,6 +825,8 @@ async function main() {
       status: 'no_work',
       worklist_count: 0,
       skipped_e2e_count: skipped.length,
+      state_root: options.stateRoot,
+      runtime_root: options.runtimeRoot,
       cleared_completed_worker: clearedCompletedWorker,
       cleared_stale_worker: clearedStaleWorker,
     }, options);
@@ -783,6 +838,8 @@ async function main() {
       status: 'dry_run',
       worklist_count: worklist.length,
       skipped_e2e_count: skipped.length,
+      state_root: options.stateRoot,
+      runtime_root: options.runtimeRoot,
       cleared_completed_worker: clearedCompletedWorker,
       cleared_stale_worker: clearedStaleWorker,
       selected,
@@ -798,6 +855,8 @@ async function main() {
       status: 'requirements_failed',
       worklist_count: worklist.length,
       skipped_e2e_count: skipped.length,
+      state_root: options.stateRoot,
+      runtime_root: options.runtimeRoot,
       cleared_completed_worker: clearedCompletedWorker,
       cleared_stale_worker: clearedStaleWorker,
       selected,
@@ -814,6 +873,8 @@ async function main() {
         status: 'worker_active',
         active_worker: await readActiveWorker(lockPath),
         lock_path: lockPath,
+        state_root: options.stateRoot,
+        runtime_root: options.runtimeRoot,
       }, options);
       return;
     }

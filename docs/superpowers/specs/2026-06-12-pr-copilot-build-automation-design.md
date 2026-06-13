@@ -41,15 +41,15 @@ program wake-up -> loop-state facts + current GitHub/Buildkite state -> reconcil
 The coordinator is a scheduled program invoked by Codex Automations, for example:
 
 ```bash
-node scripts/pr-automation-loop.mjs --project-root "$PROJECT_ROOT" --repo owner/repo
+node scripts/pr-automation-loop.mjs --project-root "$PROJECT_ROOT" --repo-id mortgage --repo owner/repo
 ```
 
 It wakes on a fixed cadence, such as every 10 minutes. The program owns polling, reconciliation, single-worker locking, prompt rendering, and worker launch. Skills guide behavior after they are loaded; they do not provide the automation runtime.
 
 Each wake-up:
 
-1. Reads project-local loop state under `.superpowers/state/`.
-2. Checks whether `.superpowers/runtime/active-worker.json` exists.
+1. Reads loop state under `$CODEX_HOME/superpowers/state-index/<repo-id>/`.
+2. Checks whether `$CODEX_HOME/superpowers/runtime/<repo-id>/active-worker.json` exists.
 3. Fetches current GitHub PR state for PRs authored by or assigned to the user.
 4. Fetches PR review comments, PR conversation comments, check runs, and linked Buildkite build/job data.
 5. Reconciles current external state against saved entity cursors and loop summaries.
@@ -152,7 +152,7 @@ If all current failures for a PR are e2e failures, the coordinator does not star
 The coordinator program maintains one global active worker lock at:
 
 ```text
-<project-root>/.superpowers/runtime/active-worker.json
+$CODEX_HOME/superpowers/runtime/<repo-id>/active-worker.json
 ```
 
 The program must acquire this lock with create-if-absent semantics before launching a worker. The lock may be updated with worker process identity after spawn because the path has already been acquired and blocks competing coordinators. If spawn fails, the program removes the lock before exiting.
@@ -172,10 +172,10 @@ State is not:
 
 ### Storage
 
-State lives in the target project repository:
+State lives under the Codex home directory so automation does not dirty the target repository's git status:
 
 ```text
-<project-root>/.superpowers/state/
+$CODEX_HOME/superpowers/state-index/<repo-id>/
   index.json
   entities/
     github-owner-repo-pr-123.json
@@ -185,12 +185,12 @@ State lives in the target project repository:
     wt-2026-06-12-pr-123-feature-foo.json
 ```
 
-This directory should usually be gitignored. It belongs with the project being worked on, not with the global Codex configuration.
+The state root is machine-local durable state. For `/Users/bhuang/workspace/mortgage`, use a stable repo id such as `mortgage` and write to `/Users/bhuang/.codex/superpowers/state-index/mortgage/`.
 
 Runtime coordination uses a separate directory:
 
 ```text
-<project-root>/.superpowers/runtime/
+$CODEX_HOME/superpowers/runtime/<repo-id>/
   active-worker.json
   runs/
     2026-06-12T10-20-00-pr-123-comment-98765/
@@ -207,7 +207,8 @@ The state handle for a PR is the entity ID plus its local entity file:
 
 ```text
 Entity ID: github:owner/repo:pull/123
-Entity file: .superpowers/state/entities/github-owner-repo-pr-123.json
+State root: /Users/bhuang/.codex/superpowers/state-index/mortgage
+Entity file: /Users/bhuang/.codex/superpowers/state-index/mortgage/entities/github-owner-repo-pr-123.json
 ```
 
 Worker prompts should identify this handle explicitly so the worker can reconcile prior facts before work begins and persist updated facts after the task is complete.
@@ -267,7 +268,7 @@ The purpose is to let the next coordinator run reconcile facts without reading c
 The single-worker invariant is enforced by:
 
 ```text
-.superpowers/runtime/active-worker.json
+$CODEX_HOME/superpowers/runtime/<repo-id>/active-worker.json
 ```
 
 Example:
@@ -277,10 +278,11 @@ Example:
   "version": 1,
   "started_at": "2026-06-12T10:20:00-07:00",
   "repo": "owner/repo",
+  "repo_id": "mortgage",
   "pr_number": 123,
   "trigger_id": "github-review-comment-98765",
   "worktree_path": "/path/to/repo/.worktrees/pr-123",
-  "run_dir": ".superpowers/runtime/runs/2026-06-12T10-20-00-pr-123-comment-98765"
+  "run_dir": "/Users/bhuang/.codex/superpowers/runtime/mortgage/runs/2026-06-12T10-20-00-pr-123-comment-98765"
 }
 ```
 
@@ -330,8 +332,10 @@ The worker prompt includes:
 You are working on PR owner/repo#123.
 
 State handle:
+- Repo ID: mortgage
+- State root: /Users/bhuang/.codex/superpowers/state-index/mortgage
 - Entity ID: github:owner/repo:pull/123
-- Entity file: .superpowers/state/entities/github-owner-repo-pr-123.json
+- Entity file: /Users/bhuang/.codex/superpowers/state-index/mortgage/entities/github-owner-repo-pr-123.json
 
 Process exactly one trigger:
 - Trigger ID: github-review-comment-98765

@@ -37,7 +37,7 @@
 
 ### Task 3: State Reconciliation
 
-- [x] Read handled trigger markers from `.superpowers/state/loops/*.md`.
+- [x] Read handled trigger markers from `$CODEX_HOME/superpowers/state-index/<repo-id>/loops/*.md`.
 - [x] Read handled GitHub reply markers from PR/comment bodies.
 - [x] Treat `pushed`, `skipped`, and `escalated` as handled outcomes.
 - [x] Treat `failed` as a completed worker outcome for lock cleanup, but not as a handled trigger.
@@ -45,7 +45,7 @@
 
 ### Task 4: Single Worker Runtime
 
-- [x] Use `.superpowers/runtime/active-worker.json` as the single-worker lock.
+- [x] Use `$CODEX_HOME/superpowers/runtime/<repo-id>/active-worker.json` as the single-worker lock.
 - [x] Preserve an active lock while the recorded worker PID is still alive.
 - [x] Clear completed locks when the run directory has completion evidence.
 - [x] Handle lock creation races as `worker_active`.

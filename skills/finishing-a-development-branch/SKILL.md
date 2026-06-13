@@ -9,7 +9,7 @@ description: Use when implementation is complete, all tests pass, and you need t
 
 Guide completion of development work by presenting clear options and handling chosen workflow.
 
-**Core principle:** Verify tests → Detect environment → Present options → Execute choice → Clean up.
+**Core principle:** Verify tests → Detect environment → Present options → Execute choice → Clean up → Persist state.
 
 **Announce at start:** "I'm using the finishing-a-development-branch skill to complete this work."
 
@@ -191,14 +191,36 @@ git worktree prune  # Self-healing: clean up any stale registrations
 
 **Otherwise:** The host environment (harness) owns this workspace. Do NOT remove it. If your platform provides a workspace-exit tool, use it. Otherwise, leave the workspace in place.
 
+### Step 7: Persist Finish State
+
+After the selected finish action reaches a terminal outcome, invoke loop-state.
+
+- **REQUIRED SUB-SKILL:** Use superpowers:loop-state
+- Do not write state files directly.
+- Capture these facts before cleanup when the selected option may remove or discard the worktree:
+  - `repo_id`
+  - `repo_root`
+  - `state_root` under `~/.codex/superpowers/state-index/<repo-id>/`
+  - `worktree_path`
+  - `branch`
+  - `base_branch`
+  - `head_sha`
+  - selected finish option
+  - final outcome
+  - PR URL if created
+  - validation commands/results
+  - `worktree_status` as `preserved` or `removed`
+
+Use loop-state to record the worktree finish summary and update entity/worktree facts. The state must be factual and must not include a next step, queue, or waiting instruction.
+
 ## Quick Reference
 
-| Option | Merge | Push | Keep Worktree | Cleanup Branch |
-|--------|-------|------|---------------|----------------|
-| 1. Merge locally | yes | - | - | yes |
-| 2. Create PR | - | yes | yes | - |
-| 3. Keep as-is | - | - | yes | - |
-| 4. Discard | - | - | - | yes (force) |
+| Option | Merge | Push | Keep Worktree | Cleanup Branch | Persist finish state with loop-state |
+|--------|-------|------|---------------|----------------|--------------------------------------|
+| 1. Merge locally | yes | - | - | yes | yes |
+| 2. Create PR | - | yes | yes | - | yes |
+| 3. Keep as-is | - | - | yes | - | yes |
+| 4. Discard | - | - | - | yes (force) | yes |
 
 ## Common Mistakes
 
@@ -230,6 +252,10 @@ git worktree prune  # Self-healing: clean up any stale registrations
 - **Problem:** Accidentally delete work
 - **Fix:** Require typed "discard" confirmation
 
+**Skipping loop-state at the end**
+- **Problem:** Later sessions cannot tell which branch, worktree, commit, PR, and validation evidence belonged to this finish action
+- **Fix:** Step 7 always invokes `superpowers:loop-state` after the finish outcome is known
+
 ## Red Flags
 
 **Never:**
@@ -240,6 +266,7 @@ git worktree prune  # Self-healing: clean up any stale registrations
 - Remove a worktree before confirming merge success
 - Clean up worktrees you didn't create (provenance check)
 - Run `git worktree remove` from inside the worktree
+- Skip loop-state after a terminal finish outcome
 
 **Always:**
 - Verify tests before offering options
@@ -249,3 +276,4 @@ git worktree prune  # Self-healing: clean up any stale registrations
 - Clean up worktree for Options 1 & 4 only
 - `cd` to main repo root before worktree removal
 - Run `git worktree prune` after removal
+- Persist finish state with loop-state after the terminal outcome

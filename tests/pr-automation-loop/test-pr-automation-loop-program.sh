@@ -21,6 +21,10 @@ trap 'rm -rf "$TMP"' EXIT
 
 FIXTURE="$TMP/facts.json"
 OUT="$TMP/out.json"
+CODEX_HOME_DIR="$TMP/codex-home"
+STATE_ROOT="$CODEX_HOME_DIR/superpowers/state-index/mortgage"
+RUNTIME_ROOT="$CODEX_HOME_DIR/superpowers/runtime/mortgage"
+COMMON_ARGS=(--project-root "$TMP" --repo-id mortgage --fixture "$FIXTURE")
 
 cat > "$FIXTURE" <<'JSON'
 {
@@ -76,11 +80,11 @@ cat > "$FIXTURE" <<'JSON'
 }
 JSON
 
-node "$SCRIPT" --project-root "$TMP" --fixture "$FIXTURE" --dry-run --json > "$OUT"
+CODEX_HOME="$CODEX_HOME_DIR" node "$SCRIPT" "${COMMON_ARGS[@]}" --dry-run --json > "$OUT"
 
-node - "$OUT" "$TMP" <<'NODE'
+node - "$OUT" "$TMP" "$STATE_ROOT" "$RUNTIME_ROOT" <<'NODE'
 const fs = require('node:fs');
-const [outPath, projectRoot] = process.argv.slice(2);
+const [outPath, projectRoot, stateRoot, runtimeRoot] = process.argv.slice(2);
 const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
 
 function assert(condition, message) {
@@ -95,20 +99,23 @@ assert(data.worklist_count === 3, `expected 3 non-e2e work items, got ${data.wor
 assert(data.skipped_e2e_count === 1, `expected 1 skipped e2e item, got ${data.skipped_e2e_count}`);
 assert(data.selected?.type === 'copilot_review_comment', `expected review comment first, got ${data.selected?.type}`);
 assert(data.selected?.trigger_id === 'github-review-comment-101', `unexpected trigger ${data.selected?.trigger_id}`);
+assert(data.state_root === stateRoot, `expected state_root ${stateRoot}, got ${data.state_root}`);
+assert(data.runtime_root === runtimeRoot, `expected runtime_root ${runtimeRoot}, got ${data.runtime_root}`);
 assert(!fs.existsSync(`${projectRoot}/.superpowers/runtime/active-worker.json`), 'dry-run created active-worker.json');
+assert(!fs.existsSync(`${runtimeRoot}/active-worker.json`), 'dry-run created global active-worker.json');
 NODE
 
-mkdir -p "$TMP/.superpowers/state/loops"
-cat > "$TMP/.superpowers/state/loops/handled-review.md" <<'MARKDOWN'
+mkdir -p "$STATE_ROOT/loops"
+cat > "$STATE_ROOT/loops/handled-review.md" <<'MARKDOWN'
 # Loop Summary
 
 Trigger: github-review-comment-101
 Outcome: pushed
-State: .superpowers/state/entities/better-mortgage-api-pr-12.json
+State: /Users/bhuang/.codex/superpowers/state-index/mortgage/entities/better-mortgage-api-pr-12.json
 Reply: https://github.com/better/mortgage-api/pull/12#discussion_r101
 MARKDOWN
 
-node "$SCRIPT" --project-root "$TMP" --fixture "$FIXTURE" --dry-run --json > "$OUT"
+CODEX_HOME="$CODEX_HOME_DIR" node "$SCRIPT" "${COMMON_ARGS[@]}" --dry-run --json > "$OUT"
 
 node - "$OUT" <<'NODE'
 const fs = require('node:fs');
@@ -127,18 +134,18 @@ assert(data.worklist_count === 2, `expected handled review comment to be filtere
 assert(data.selected?.trigger_id === 'github-pr-comment-202', `expected PR comment after handled review, got ${data.selected?.trigger_id}`);
 NODE
 
-mkdir -p "$TMP/.superpowers/runtime"
-COMPLETED_RUN="$TMP/.superpowers/runtime/runs/completed"
+mkdir -p "$RUNTIME_ROOT"
+COMPLETED_RUN="$RUNTIME_ROOT/runs/completed"
 mkdir -p "$COMPLETED_RUN"
 cat > "$COMPLETED_RUN/final.md" <<'MARKDOWN'
 Outcome: failed
 Trigger: github-review-comment-101
 Commit: abcdef0
 Validation: unit tests passed
-State: .superpowers/state/loops/handled-review.md
+State: /Users/bhuang/.codex/superpowers/state-index/mortgage/loops/handled-review.md
 Reply: https://github.com/better/mortgage-api/pull/12#discussion_r101
 MARKDOWN
-cat > "$TMP/.superpowers/runtime/active-worker.json" <<'JSON'
+cat > "$RUNTIME_ROOT/active-worker.json" <<JSON
 {
   "version": 1,
   "status": "running",
@@ -146,15 +153,15 @@ cat > "$TMP/.superpowers/runtime/active-worker.json" <<'JSON'
   "pr_number": 12,
   "trigger_id": "github-review-comment-101",
   "worker_pid": 999999,
-  "run_dir": ".superpowers/runtime/runs/completed"
+  "run_dir": "$COMPLETED_RUN"
 }
 JSON
 
-node "$SCRIPT" --project-root "$TMP" --fixture "$FIXTURE" --dry-run --json > "$OUT"
+CODEX_HOME="$CODEX_HOME_DIR" node "$SCRIPT" "${COMMON_ARGS[@]}" --dry-run --json > "$OUT"
 
-node - "$OUT" "$TMP" <<'NODE'
+node - "$OUT" "$TMP" "$RUNTIME_ROOT" <<'NODE'
 const fs = require('node:fs');
-const [outPath, projectRoot] = process.argv.slice(2);
+const [outPath, projectRoot, runtimeRoot] = process.argv.slice(2);
 const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
 
 function assert(condition, message) {
@@ -166,11 +173,12 @@ function assert(condition, message) {
 
 assert(data.status === 'dry_run', `expected completed lock to be cleared and dry-run to continue, got ${data.status}`);
 assert(data.cleared_completed_worker === true, 'expected completed lock clearance to be reported');
-assert(!fs.existsSync(`${projectRoot}/.superpowers/runtime/active-worker.json`), 'completed lock was not cleared');
+assert(!fs.existsSync(`${runtimeRoot}/active-worker.json`), 'completed global lock was not cleared');
+assert(!fs.existsSync(`${projectRoot}/.superpowers/runtime/active-worker.json`), 'project-local runtime lock was created');
 assert(data.selected?.trigger_id === 'github-pr-comment-202', `expected remaining PR comment after completed lock, got ${data.selected?.trigger_id}`);
 NODE
 
-cat > "$TMP/.superpowers/runtime/active-worker.json" <<'JSON'
+cat > "$RUNTIME_ROOT/active-worker.json" <<'JSON'
 {
   "version": 1,
   "repo": "better/mortgage-api",
@@ -181,7 +189,7 @@ cat > "$TMP/.superpowers/runtime/active-worker.json" <<'JSON'
 }
 JSON
 
-node "$SCRIPT" --project-root "$TMP" --fixture "$FIXTURE" --dry-run --json > "$OUT"
+CODEX_HOME="$CODEX_HOME_DIR" node "$SCRIPT" "${COMMON_ARGS[@]}" --dry-run --json > "$OUT"
 
 node - "$OUT" <<'NODE'
 const fs = require('node:fs');
@@ -194,15 +202,15 @@ if (data.status !== 'worker_active') {
 }
 NODE
 
-rm -f "$TMP/.superpowers/runtime/active-worker.json"
+rm -f "$RUNTIME_ROOT/active-worker.json"
 EMPTYBIN="$TMP/emptybin"
 mkdir -p "$EMPTYBIN"
 
-PATH="$EMPTYBIN" "$NODE_BIN" "$SCRIPT" --project-root "$TMP" --fixture "$FIXTURE" --json > "$OUT"
+CODEX_HOME="$CODEX_HOME_DIR" PATH="$EMPTYBIN" "$NODE_BIN" "$SCRIPT" "${COMMON_ARGS[@]}" --json > "$OUT"
 
-node - "$OUT" "$TMP" <<'NODE'
+node - "$OUT" "$TMP" "$RUNTIME_ROOT" <<'NODE'
 const fs = require('node:fs');
-const [outPath, projectRoot] = process.argv.slice(2);
+const [outPath, projectRoot, runtimeRoot] = process.argv.slice(2);
 const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
 
 function assert(condition, message) {
@@ -217,6 +225,7 @@ assert(data.selected?.trigger_id === 'github-pr-comment-202', `expected selected
 assert(Array.isArray(data.missing_requirements), 'expected missing_requirements array');
 assert(data.missing_requirements.some(requirement => requirement.id === 'codex'), 'expected missing codex requirement');
 assert(!fs.existsSync(`${projectRoot}/.superpowers/runtime/active-worker.json`), 'requirements failure created active-worker.json');
+assert(!fs.existsSync(`${runtimeRoot}/active-worker.json`), 'requirements failure created global active-worker.json');
 NODE
 
 FAKEBIN="$TMP/fakebin"
@@ -245,19 +254,19 @@ Outcome: skipped
 Trigger: fake
 Commit: none
 Validation: not run
-State: .superpowers/state/loops/fake.md
+State: /tmp/codex/superpowers/state-index/mortgage/loops/fake.md
 Reply: none
 MARKDOWN
 fi
 BASH
 chmod +x "$FAKEBIN/codex"
 
-PATH="$FAKEBIN:$PATH" node "$SCRIPT" --project-root "$TMP" --fixture "$FIXTURE" --json > "$OUT"
+CODEX_HOME="$CODEX_HOME_DIR" PATH="$FAKEBIN:$PATH" node "$SCRIPT" "${COMMON_ARGS[@]}" --json > "$OUT"
 
-node - "$OUT" "$TMP" <<'NODE'
+node - "$OUT" "$TMP" "$RUNTIME_ROOT" "$STATE_ROOT" <<'NODE'
 const fs = require('node:fs');
 const path = require('node:path');
-const [outPath, projectRoot] = process.argv.slice(2);
+const [outPath, projectRoot, runtimeRoot, stateRoot] = process.argv.slice(2);
 const data = JSON.parse(fs.readFileSync(outPath, 'utf8'));
 
 function assert(condition, message) {
@@ -270,16 +279,20 @@ function assert(condition, message) {
 assert(data.status === 'launched', `expected launched status, got ${data.status}`);
 assert(data.selected?.trigger_id === 'github-pr-comment-202', `expected launch to use first unhandled item, got ${data.selected?.trigger_id}`);
 assert(Number.isInteger(data.worker_pid), 'expected worker_pid in launch output');
+assert(data.state_root === stateRoot, `expected state_root ${stateRoot}, got ${data.state_root}`);
+assert(data.runtime_root === runtimeRoot, `expected runtime_root ${runtimeRoot}, got ${data.runtime_root}`);
 
-const lockPath = path.join(projectRoot, '.superpowers/runtime/active-worker.json');
+const lockPath = path.join(runtimeRoot, 'active-worker.json');
 const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
 assert(lock.status === 'running', `expected running lock, got ${lock.status}`);
 assert(lock.trigger_id === 'github-pr-comment-202', `expected lock trigger github-pr-comment-202, got ${lock.trigger_id}`);
 assert(Number.isInteger(lock.worker_pid), 'expected worker_pid in lock');
+assert(!fs.existsSync(path.join(projectRoot, '.superpowers/runtime/active-worker.json')), 'launch created project-local runtime lock');
 
-const prompt = fs.readFileSync(path.join(projectRoot, lock.run_dir, 'worker-prompt.md'), 'utf8');
+const prompt = fs.readFileSync(path.join(lock.run_dir, 'worker-prompt.md'), 'utf8');
 assert(prompt.includes('Process exactly one trigger'), 'worker prompt was not rendered from template');
 assert(prompt.includes('github-pr-comment-202'), 'worker prompt missing selected trigger');
+assert(prompt.includes(stateRoot), 'worker prompt missing global state root');
 NODE
 
 pass "pr-automation-loop program derives work, reconciles state, and respects active worker lock"
